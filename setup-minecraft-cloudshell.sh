@@ -431,9 +431,9 @@ setup_playit_claim() {
     if [[ ! -t 0 ]]; then
       die "playit first-time setup requires an interactive terminal. Rerun without --skip-playit-claim in a terminal."
     fi
-    log "Running playit CLI. Follow its login/claim instructions, then exit the CLI when setup is complete."
+    log "Running playit setup. Open the claim link it prints; setup will continue after the claim completes."
     set +e
-    "$INSTALL_DIR/playit-cli-linux-amd64" --socket-path "$socket"
+    "$INSTALL_DIR/playit-cli-linux-amd64" --socket-path "$socket" setup
     local cli_code=$?
     set -e
     if [[ "$cli_code" -ne 0 ]]; then

@@ -142,13 +142,13 @@ During first-time setup it starts the daemon in the background:
   --secret-path ~/.config/playit_gg/playit.toml
 ```
 
-Then it runs the CLI in the foreground:
+Then it runs the first-time setup command in the foreground:
 
 ```bash
-./playit-cli-linux-amd64 --socket-path /tmp/playit.sock
+./playit-cli-linux-amd64 --socket-path /tmp/playit.sock setup
 ```
 
-Follow the playit login/claim instructions. After the CLI exits, the setup script verifies:
+Open the printed playit claim link. After the claim completes and the CLI exits, the setup script verifies:
 
 - `~/.config/playit_gg/playit.toml` exists and is non-empty
 - the playit daemon is still running
