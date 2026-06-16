@@ -1,0 +1,18 @@
+# Build outputs
+cloudshell-mc-autostart
+
+# Local generated state
+.gocache/
+.runtime/
+.monitor/
+server/
+minecraft-server/
+
+# Downloaded artifacts
+*.jar
+playit-linux-amd64
+playit-cli-linux-amd64
+
+# Local secrets/logs
+.env
+*.log
