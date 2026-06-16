@@ -312,7 +312,7 @@ Machine metrics are sampled every 30 seconds and stored in:
 ~/minecraft-server/.monitor/metrics.jsonl
 ```
 
-The monitor keeps roughly 30 days of samples and prunes older entries.
+The monitor keeps roughly 7 days of samples and prunes older entries.
 
 ## Rerunning The Setup Script
 

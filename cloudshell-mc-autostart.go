@@ -30,8 +30,9 @@ import (
 )
 
 const (
-	lockFileName = "supervisor.lock"
-	pidFileName  = "supervisor.pid"
+	lockFileName    = "supervisor.lock"
+	pidFileName     = "supervisor.pid"
+	metricRetention = 7 * 24 * time.Hour
 )
 
 type config struct {
@@ -614,7 +615,7 @@ func (a *app) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, a.metrics.recent(240))
+	writeJSON(w, a.metrics.since(metricRetention))
 }
 
 func (a *app) handleLogs(w http.ResponseWriter, r *http.Request) {
@@ -769,7 +770,7 @@ func (a *app) collectMetrics(ctx context.Context) {
 			return
 		case <-ticker.C:
 			a.metrics.add(a.collectMachineMetric())
-			a.metrics.prune(30 * 24 * time.Hour)
+			a.metrics.prune(metricRetention)
 		}
 	}
 }
@@ -853,13 +854,18 @@ func (ms *metricStore) add(p metricPoint) {
 	_, _ = file.Write(append(data, '\n'))
 }
 
-func (ms *metricStore) recent(n int) []metricPoint {
+func (ms *metricStore) since(maxAge time.Duration) []metricPoint {
+	cutoff := time.Now().Add(-maxAge)
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
-	if len(ms.points) <= n {
-		return append([]metricPoint(nil), ms.points...)
+	points := make([]metricPoint, 0, len(ms.points))
+	for _, p := range ms.points {
+		t, err := time.Parse(time.RFC3339, p.Time)
+		if err == nil && t.After(cutoff) {
+			points = append(points, p)
+		}
 	}
-	return append([]metricPoint(nil), ms.points[len(ms.points)-n:]...)
+	return points
 }
 
 func (ms *metricStore) prune(maxAge time.Duration) {
@@ -1544,7 +1550,7 @@ canvas { width: 100%; height: 160px; display: block; }
     </div>
 
     <div class="panel full">
-      <h2>Machine History</h2>
+      <h2>Machine History - Last 7 Days</h2>
       <canvas id="chart" width="1200" height="220"></canvas>
     </div>
 
