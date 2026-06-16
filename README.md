@@ -105,6 +105,8 @@ world/
 
 The Fabric installer is resolved from Fabric Maven metadata. If that lookup fails, the script falls back to Fabric installer `1.1.1`.
 
+On a fresh Fabric install, `server.properties` may not exist until the server is started for the first time. The setup script creates a minimal initial `server.properties` in that case so RCON/query settings can be configured before the monitor starts the server.
+
 ## EULA Handling
 
 The script does not silently accept the Minecraft EULA.

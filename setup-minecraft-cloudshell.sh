@@ -162,7 +162,9 @@ install_sdkman() {
     curl -s "https://get.sdkman.io" | bash
   fi
   # shellcheck disable=SC1091
+  set +u
   source "$SDKMAN_DIR/bin/sdkman-init.sh"
+  set -u
 
   if [[ -f "$SDKMAN_DIR/etc/config" ]]; then
     sed -i 's/^sdkman_auto_answer=.*/sdkman_auto_answer=true/' "$SDKMAN_DIR/etc/config" || true
@@ -244,7 +246,11 @@ fallback_java_major() {
 select_sdkman_java_identifier() {
   local major="$1"
   local list_file="$SETUP_DIR/sdk-java-list.txt"
+  set +u
   sdk list java > "$list_file"
+  local sdk_list_status=$?
+  set -u
+  [[ "$sdk_list_status" -eq 0 ]] || die "Unable to list Java candidates with SDKMAN."
 
   local id
   id="$(awk -F'|' -v major="$major" '
@@ -278,9 +284,11 @@ select_sdkman_java_identifier() {
 install_java() {
   JAVA_IDENTIFIER="$(select_sdkman_java_identifier "$JAVA_MAJOR")"
   log "Installing/selecting Java candidate: $JAVA_IDENTIFIER"
+  set +u
   sdk install java "$JAVA_IDENTIFIER" || true
   sdk default java "$JAVA_IDENTIFIER"
   sdk use java "$JAVA_IDENTIFIER" >/dev/null
+  set -u
   hash -r
 
   local java_output
@@ -326,7 +334,21 @@ install_fabric_server() {
   fi
 
   [[ -f "$INSTALL_DIR/fabric-server-launch.jar" ]] || die "Fabric installer did not create fabric-server-launch.jar."
-  [[ -f "$INSTALL_DIR/server.properties" ]] || die "Fabric/Minecraft install did not create server.properties."
+  if [[ ! -f "$INSTALL_DIR/server.properties" ]]; then
+    log "Creating initial server.properties"
+    cat > "$INSTALL_DIR/server.properties" <<'PROPS'
+server-port=25565
+max-players=20
+enable-status=true
+enable-query=false
+enable-rcon=false
+rcon.port=25575
+rcon.password=
+query.port=25565
+online-mode=true
+motd=A Minecraft Server
+PROPS
+  fi
 
   if [[ "$AGREE_EULA" -ne 1 ]]; then
     if [[ ! -t 0 ]]; then
