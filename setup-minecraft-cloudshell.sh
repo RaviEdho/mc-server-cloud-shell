@@ -10,6 +10,7 @@ REUSE=0
 FORCE=0
 SKIP_PLAYIT_CLAIM=0
 START_MONITOR=1
+UPDATE_AUTOSTART=0
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SETUP_DIR=""
@@ -38,11 +39,13 @@ Options:
   --force                   Move an existing install directory aside as a timestamped backup.
   --skip-playit-claim       Skip interactive playit CLI claim flow.
   --no-start                Do not start the monitor at the end.
+  --update-autostart        Update/rebuild and restart only the autostart monitor.
   -h, --help                Show this help.
 
 Examples:
   ./setup-minecraft-cloudshell.sh --agree-eula
   ./setup-minecraft-cloudshell.sh --mc-version 1.21.6 --agree-eula
+  ./setup-minecraft-cloudshell.sh --update-autostart
 USAGE
 }
 
@@ -78,6 +81,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-start)
       START_MONITOR=0
+      shift
+      ;;
+    --update-autostart)
+      UPDATE_AUTOSTART=1
       shift
       ;;
     -h|--help)
@@ -451,15 +458,41 @@ setup_playit_claim() {
 }
 
 install_monitor() {
-  local go_source="$SCRIPT_DIR/cloudshell-mc-autostart.go"
-  [[ -f "$go_source" ]] || die "Missing monitor source next to setup script: $go_source"
-  cp "$go_source" "$INSTALL_DIR/cloudshell-mc-autostart.go"
-
-  log "Building monitor"
-  GOCACHE="$INSTALL_DIR/.gocache" go build -o "$INSTALL_DIR/cloudshell-mc-autostart" "$INSTALL_DIR/cloudshell-mc-autostart.go"
-  chmod +x "$INSTALL_DIR/cloudshell-mc-autostart"
-
+  update_autostart_program
   MC_AUTOSTART_ROOT="$INSTALL_DIR" "$INSTALL_DIR/cloudshell-mc-autostart" -mode configure
+}
+
+update_autostart_program() {
+  local go_source="$SCRIPT_DIR/cloudshell-mc-autostart.go"
+  local installed_source="$INSTALL_DIR/cloudshell-mc-autostart.go"
+  local installed_binary="$INSTALL_DIR/cloudshell-mc-autostart"
+  local source_updated=0
+  local rebuilt=0
+
+  [[ -f "$go_source" ]] || die "Missing monitor source next to setup script: $go_source"
+
+  mkdir -p "$INSTALL_DIR" "$INSTALL_DIR/.gocache"
+
+  if [[ ! -f "$installed_source" || "$go_source" -nt "$installed_source" ]]; then
+    log "Updating monitor source: $installed_source"
+    cp "$go_source" "$installed_source"
+    source_updated=1
+  else
+    log "Monitor source is already current."
+  fi
+
+  if [[ "$source_updated" -eq 1 || ! -x "$installed_binary" || "$installed_source" -nt "$installed_binary" ]]; then
+    log "Building monitor"
+    GOCACHE="$INSTALL_DIR/.gocache" go build -o "$installed_binary" "$installed_source"
+    chmod +x "$installed_binary"
+    rebuilt=1
+  else
+    log "Monitor binary is already current."
+  fi
+
+  if [[ "$source_updated" -eq 0 && "$rebuilt" -eq 0 ]]; then
+    log "No autostart monitor update needed."
+  fi
 }
 
 install_bashrc_hook() {
@@ -539,7 +572,26 @@ start_and_verify_monitor() {
   die "Monitor started, but Minecraft did not become healthy in time."
 }
 
+update_autostart_only() {
+  require_command bash
+  require_command cp
+  require_command chmod
+  require_command go
+  require_command mkdir
+
+  [[ -d "$INSTALL_DIR" ]] || die "Install directory does not exist: $INSTALL_DIR"
+  update_autostart_program
+  log "Restarting monitor without stopping Minecraft."
+  MC_AUTOSTART_ROOT="$INSTALL_DIR" "$INSTALL_DIR/cloudshell-mc-autostart" -mode restart-monitor
+  log "Autostart monitor update complete."
+}
+
 main() {
+  if [[ "$UPDATE_AUTOSTART" -eq 1 ]]; then
+    update_autostart_only
+    return 0
+  fi
+
   check_prerequisites
   prepare_install_dir
   install_sdkman

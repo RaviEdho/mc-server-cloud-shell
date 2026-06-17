@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -69,6 +70,7 @@ type processManager struct {
 	name        string
 	dir         string
 	args        []string
+	adoptTokens []string
 	beforeStart func()
 
 	mu        sync.Mutex
@@ -79,6 +81,7 @@ type processManager struct {
 	stoppedAt time.Time
 	lastError string
 	cmd       *exec.Cmd
+	adopted   bool
 }
 
 type processSnapshot struct {
@@ -144,7 +147,7 @@ type playitStatus struct {
 }
 
 func main() {
-	mode := flag.String("mode", "start", "start, daemon, stop, status, or configure")
+	mode := flag.String("mode", "start", "start, daemon, stop, restart-monitor, status, or configure")
 	flag.Parse()
 
 	cfg, err := loadConfig()
@@ -159,6 +162,8 @@ func main() {
 		err = runDaemon(cfg)
 	case "stop":
 		err = stopDaemon(cfg)
+	case "restart-monitor":
+		err = restartMonitor(cfg)
 	case "status":
 		err = status(cfg)
 	case "configure":
@@ -317,8 +322,18 @@ func runDaemon(cfg config) error {
 		return err
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	ctx, cancel := context.WithCancel(context.Background())
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGUSR2)
+	defer signal.Stop(sigCh)
+	var handoff atomic.Bool
+	go func() {
+		sig := <-sigCh
+		if sig == syscall.SIGUSR2 {
+			handoff.Store(true)
+		}
+		cancel()
+	}()
 
 	a := &app{
 		cfg:     cfg,
@@ -330,7 +345,7 @@ func runDaemon(cfg config) error {
 		filepath.Join(cfg.root, "playit-linux-amd64"),
 		"--socket-path", cfg.socketPath,
 		"--secret-path", cfg.secretPath,
-	}, func() {
+	}, []string{"playit-linux-amd64", "--socket-path", cfg.socketPath}, func() {
 		_ = os.Remove(cfg.socketPath)
 	})
 	a.minecraft = newProcessManager("minecraft", cfg.serverDir, []string{
@@ -339,7 +354,7 @@ func runDaemon(cfg config) error {
 		"-Xmx" + cfg.maxRAM,
 		"-jar", "fabric-server-launch.jar",
 		"nogui",
-	}, nil)
+	}, []string{"fabric-server-launch.jar", "nogui"}, nil)
 
 	log("monitor started root=%s web=%s java=%s", cfg.root, cfg.webAddr, cfg.javaBin)
 
@@ -350,7 +365,7 @@ func runDaemon(cfg config) error {
 		wg.Add(1)
 		go func(pm *processManager) {
 			defer wg.Done()
-			pm.supervise(ctx, cfg.runtimeDir, log)
+			pm.supervise(ctx, cfg.runtimeDir, &handoff, log)
 		}(pm)
 	}
 
@@ -380,21 +395,29 @@ func runDaemon(cfg config) error {
 	}()
 
 	<-ctx.Done()
-	log("monitor stopping")
+	if handoff.Load() {
+		log("monitor handoff requested")
+	} else {
+		log("monitor stopping")
+	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
 	a.rcon.close()
-	a.minecraft.stopGracefully(30*time.Second, log)
-	a.playit.stopGracefully(10*time.Second, log)
+	if !handoff.Load() {
+		a.minecraft.stopGracefully(30*time.Second, log)
+		a.playit.stopGracefully(10*time.Second, log)
+	}
 	wg.Wait()
-	_ = os.Remove(cfg.socketPath)
+	if !handoff.Load() {
+		_ = os.Remove(cfg.socketPath)
+	}
 	log("monitor stopped")
 	return nil
 }
 
-func newProcessManager(name, dir string, args []string, beforeStart func()) *processManager {
-	return &processManager{name: name, dir: dir, args: args, beforeStart: beforeStart}
+func newProcessManager(name, dir string, args []string, adoptTokens []string, beforeStart func()) *processManager {
+	return &processManager{name: name, dir: dir, args: args, adoptTokens: adoptTokens, beforeStart: beforeStart}
 }
 
 func (pm *processManager) startDesired() {
@@ -430,7 +453,7 @@ func (pm *processManager) snapshot() processSnapshot {
 	return s
 }
 
-func (pm *processManager) supervise(ctx context.Context, runtimeDir string, log func(string, ...any)) {
+func (pm *processManager) supervise(ctx context.Context, runtimeDir string, handoff *atomic.Bool, log func(string, ...any)) {
 	backoff := 5 * time.Second
 	for {
 		select {
@@ -440,6 +463,12 @@ func (pm *processManager) supervise(ctx context.Context, runtimeDir string, log 
 		}
 		if !pm.isDesired() {
 			time.Sleep(time.Second)
+			continue
+		}
+		if pid := pm.findAdoptablePID(runtimeDir); pid > 0 {
+			pm.markAdopted(pid)
+			log("adopted existing %s process group %d", pm.name, pid)
+			pm.monitorAdopted(ctx, runtimeDir, log)
 			continue
 		}
 		if pm.beforeStart != nil {
@@ -468,6 +497,7 @@ func (pm *processManager) supervise(ctx context.Context, runtimeDir string, log 
 			sleepOrDone(ctx, backoff)
 			continue
 		}
+		pm.writePID(runtimeDir, cmd.Process.Pid, log)
 		pm.markStarted(cmd)
 		done := make(chan error, 1)
 		go func() { done <- cmd.Wait() }()
@@ -476,12 +506,18 @@ func (pm *processManager) supervise(ctx context.Context, runtimeDir string, log 
 		case err = <-done:
 			_ = out.Close()
 			pm.markStopped(err)
+			pm.removePID(runtimeDir)
 		case <-ctx.Done():
+			if handoff.Load() {
+				_ = out.Close()
+				return
+			}
 			log("stopping %s", pm.name)
 			stopProcessGroup(cmd.Process.Pid, 10*time.Second, log)
 			err = <-done
 			_ = out.Close()
 			pm.markStopped(err)
+			pm.removePID(runtimeDir)
 			return
 		}
 		if err != nil {
@@ -508,13 +544,54 @@ func (pm *processManager) isDesired() bool {
 	return pm.desired
 }
 
+func (pm *processManager) monitorAdopted(ctx context.Context, runtimeDir string, log func(string, ...any)) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Second):
+			pm.mu.Lock()
+			pid := pm.pid
+			desired := pm.desired
+			pm.mu.Unlock()
+			if pid <= 0 {
+				return
+			}
+			if !desired {
+				log("stopping adopted %s process group %d", pm.name, pid)
+				stopProcessGroup(pid, 10*time.Second, log)
+			}
+			if !desired || !processRunning(pid) {
+				pm.markStopped(nil)
+				pm.removePID(runtimeDir)
+				return
+			}
+		}
+	}
+}
+
 func (pm *processManager) markStarted(cmd *exec.Cmd) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 	pm.cmd = cmd
 	pm.pid = cmd.Process.Pid
 	pm.running = true
+	pm.adopted = false
 	pm.startedAt = time.Now()
+	pm.stoppedAt = time.Time{}
+	pm.lastError = ""
+}
+
+func (pm *processManager) markAdopted(pid int) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	pm.cmd = nil
+	pm.pid = pid
+	pm.running = true
+	pm.adopted = true
+	if pm.startedAt.IsZero() {
+		pm.startedAt = time.Now()
+	}
 	pm.stoppedAt = time.Time{}
 	pm.lastError = ""
 }
@@ -525,6 +602,7 @@ func (pm *processManager) markStopped(err error) {
 	pm.cmd = nil
 	pm.pid = 0
 	pm.running = false
+	pm.adopted = false
 	pm.stoppedAt = time.Now()
 	if err != nil {
 		pm.lastError = err.Error()
@@ -537,27 +615,61 @@ func (pm *processManager) setError(msg string) {
 	pm.lastError = msg
 }
 
+func (pm *processManager) pidPath(runtimeDir string) string {
+	return filepath.Join(runtimeDir, pm.name+".pid")
+}
+
+func (pm *processManager) writePID(runtimeDir string, pid int, log func(string, ...any)) {
+	if err := os.WriteFile(pm.pidPath(runtimeDir), []byte(strconv.Itoa(pid)+"\n"), 0644); err != nil {
+		log("write %s pid failed: %v", pm.name, err)
+	}
+}
+
+func (pm *processManager) removePID(runtimeDir string) {
+	_ = os.Remove(pm.pidPath(runtimeDir))
+}
+
+func (pm *processManager) findAdoptablePID(runtimeDir string) int {
+	if pid := readProcessPID(pm.pidPath(runtimeDir)); processRunning(pid) {
+		return pid
+	}
+	pid := findProcessByCmdline(pm.adoptTokens)
+	if pid > 0 {
+		return pid
+	}
+	pm.removePID(runtimeDir)
+	return 0
+}
+
 func (pm *processManager) stopGracefully(timeout time.Duration, log func(string, ...any)) {
 	pm.stopDesired()
 	pm.mu.Lock()
 	cmd := pm.cmd
+	pid := pm.pid
 	pm.mu.Unlock()
-	if cmd == nil || cmd.Process == nil {
+	if cmd != nil && cmd.Process != nil {
+		pid = cmd.Process.Pid
+	}
+	if pid <= 0 {
 		return
 	}
-	stopProcessGroup(cmd.Process.Pid, timeout, log)
+	stopProcessGroup(pid, timeout, log)
 }
 
 func (pm *processManager) kill(log func(string, ...any)) {
 	pm.stopDesired()
 	pm.mu.Lock()
 	cmd := pm.cmd
+	pid := pm.pid
 	pm.mu.Unlock()
-	if cmd == nil || cmd.Process == nil {
+	if cmd != nil && cmd.Process != nil {
+		pid = cmd.Process.Pid
+	}
+	if pid <= 0 {
 		return
 	}
-	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	log("killed %s process group %d", pm.name, cmd.Process.Pid)
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
+	log("killed %s process group %d", pm.name, pid)
 }
 
 func stopProcessGroup(pid int, timeout time.Duration, log func(string, ...any)) {
@@ -1288,6 +1400,36 @@ func stopDaemon(cfg config) error {
 	return nil
 }
 
+func restartMonitor(cfg config) error {
+	pid, err := readPID(cfg)
+	if err != nil {
+		fmt.Println("Monitor is not running; starting it.")
+		return startDaemon(cfg)
+	}
+	if !processRunning(pid) {
+		_ = os.Remove(filepath.Join(cfg.runtimeDir, pidFileName))
+		fmt.Println("Monitor PID file exists, but the process is not running; starting it.")
+		return startDaemon(cfg)
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	if err := proc.Signal(syscall.SIGUSR2); err != nil {
+		return err
+	}
+	fmt.Printf("Sent handoff restart signal to monitor PID %d.\n", pid)
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if !processRunning(pid) {
+			_ = os.Remove(filepath.Join(cfg.runtimeDir, pidFileName))
+			return startDaemon(cfg)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return fmt.Errorf("monitor PID %d did not exit after handoff signal", pid)
+}
+
 func status(cfg config) error {
 	pid, err := readPID(cfg)
 	if err != nil {
@@ -1357,6 +1499,57 @@ func processRunning(pid int) bool {
 		return false
 	}
 	return proc.Signal(syscall.Signal(0)) == nil
+}
+
+func readProcessPID(path string) int {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0
+	}
+	return pid
+}
+
+func findProcessByCmdline(tokens []string) int {
+	if len(tokens) == 0 {
+		return 0
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0
+	}
+	self := os.Getpid()
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid <= 0 || pid == self {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+		if err != nil || len(data) == 0 {
+			continue
+		}
+		cmdline := strings.ReplaceAll(string(data), "\x00", " ")
+		matched := true
+		for _, token := range tokens {
+			if token == "" {
+				continue
+			}
+			if !strings.Contains(cmdline, token) {
+				matched = false
+				break
+			}
+		}
+		if matched && processRunning(pid) {
+			return pid
+		}
+	}
+	return 0
 }
 
 func readOrCreateSecret(path string) string {
