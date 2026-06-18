@@ -146,6 +146,10 @@ type playitStatus struct {
 	LastError    string `json:"lastError,omitempty"`
 }
 
+type commandRequest struct {
+	Command string `json:"command"`
+}
+
 func main() {
 	mode := flag.String("mode", "start", "start, daemon, stop, restart-monitor, status, or configure")
 	flag.Parse()
@@ -708,6 +712,7 @@ func (a *app) routes() http.Handler {
 	mux.HandleFunc("/api/status", a.handleStatus)
 	mux.HandleFunc("/api/metrics", a.handleMetrics)
 	mux.HandleFunc("/api/logs", a.handleLogs)
+	mux.HandleFunc("/api/command", a.handleCommand)
 	mux.HandleFunc("/api/minecraft/", a.handleAction("minecraft"))
 	mux.HandleFunc("/api/playit/", a.handleAction("playit"))
 	return mux
@@ -719,6 +724,7 @@ func (a *app) handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
 	_ = dashboardTemplate.Execute(w, nil)
 }
 
@@ -733,23 +739,78 @@ func (a *app) handleMetrics(w http.ResponseWriter, r *http.Request) {
 func (a *app) handleLogs(w http.ResponseWriter, r *http.Request) {
 	target := r.URL.Query().Get("target")
 	search := strings.TrimSpace(r.URL.Query().Get("q"))
-	var path string
-	switch target {
-	case "minecraft":
-		path = filepath.Join(a.cfg.runtimeDir, "minecraft.log")
-	case "playit":
-		path = filepath.Join(a.cfg.runtimeDir, "playit.log")
-	case "server":
-		path = filepath.Join(a.cfg.serverDir, "logs", "latest.log")
-	default:
-		path = filepath.Join(a.cfg.runtimeDir, "supervisor.log")
-	}
+	path := a.logPath(target)
 	lines, err := tailLines(path, 200, search)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, map[string]any{"target": target, "lines": lines})
+}
+
+func (a *app) logPath(target string) string {
+	switch target {
+	case "server", "minecraft":
+		return filepath.Join(a.cfg.runtimeDir, "minecraft.log")
+	case "playit":
+		return filepath.Join(a.cfg.runtimeDir, "playit.log")
+	case "latest":
+		return filepath.Join(a.cfg.serverDir, "logs", "latest.log")
+	default:
+		return filepath.Join(a.cfg.runtimeDir, "supervisor.log")
+	}
+}
+
+func (a *app) handleCommand(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req commandRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		http.Error(w, "invalid command request", http.StatusBadRequest)
+		return
+	}
+	command := strings.TrimSpace(req.Command)
+	command = strings.TrimPrefix(command, "/")
+	command = strings.TrimSpace(command)
+	if command == "" {
+		http.Error(w, "command is required", http.StatusBadRequest)
+		return
+	}
+	if len(command) > 1024 {
+		http.Error(w, "command is too long", http.StatusBadRequest)
+		return
+	}
+	rconCommand := dashboardRCONCommand(command)
+	out, err := a.rconCommand(rconCommand)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if rconCommand != command {
+		a.log("dashboard command: %s -> %s", command, rconCommand)
+	} else {
+		a.log("dashboard command: %s", command)
+	}
+	writeJSON(w, map[string]string{"command": command, "output": out})
+}
+
+func dashboardRCONCommand(command string) string {
+	name, message, ok := strings.Cut(command, " ")
+	if !ok || !strings.EqualFold(name, "say") {
+		return command
+	}
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return command
+	}
+	payload, err := json.Marshal(map[string]string{"text": "[Server] " + message})
+	if err != nil {
+		return command
+	}
+	return "tellraw @a " + string(payload)
 }
 
 func (a *app) handleAction(target string) http.HandlerFunc {
@@ -1365,7 +1426,7 @@ func tailLines(path string, limit int, search string) ([]string, error) {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
-		if search == "" || strings.Contains(strings.ToLower(line), strings.ToLower(search)) {
+		if logLineMatches(line, search) {
 			filtered = append(filtered, line)
 		}
 	}
@@ -1373,6 +1434,13 @@ func tailLines(path string, limit int, search string) ([]string, error) {
 		filtered = filtered[len(filtered)-limit:]
 	}
 	return filtered, nil
+}
+
+func logLineMatches(line string, search string) bool {
+	if search == "" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(line), strings.ToLower(search))
 }
 
 func dialOK(addr string, timeout time.Duration) bool {
@@ -1419,15 +1487,20 @@ func restartMonitor(cfg config) error {
 		return err
 	}
 	fmt.Printf("Sent handoff restart signal to monitor PID %d.\n", pid)
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
-		if !processRunning(pid) {
-			_ = os.Remove(filepath.Join(cfg.runtimeDir, pidFileName))
-			return startDaemon(cfg)
-		}
-		time.Sleep(250 * time.Millisecond)
+	if waitForProcessExit(pid, 8*time.Second) {
+		_ = os.Remove(filepath.Join(cfg.runtimeDir, pidFileName))
+		return startDaemon(cfg)
 	}
-	return fmt.Errorf("monitor PID %d did not exit after handoff signal", pid)
+
+	fmt.Printf("Monitor PID %d did not exit after handoff signal; killing only the monitor process.\n", pid)
+	if err := proc.Signal(syscall.SIGKILL); err != nil {
+		return err
+	}
+	if waitForProcessExit(pid, 8*time.Second) {
+		_ = os.Remove(filepath.Join(cfg.runtimeDir, pidFileName))
+		return startDaemon(cfg)
+	}
+	return fmt.Errorf("monitor PID %d did not exit after SIGKILL", pid)
 }
 
 func status(cfg config) error {
@@ -1494,11 +1567,38 @@ func processRunning(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
+	if processZombie(pid) {
+		return false
+	}
 	proc, err := os.FindProcess(pid)
 	if err != nil {
 		return false
 	}
 	return proc.Signal(syscall.Signal(0)) == nil
+}
+
+func waitForProcessExit(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !processRunning(pid) {
+			return true
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return !processRunning(pid)
+}
+
+func processZombie(pid int) bool {
+	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "status"))
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "State:") {
+			return strings.Contains(line, "Z")
+		}
+	}
+	return false
 }
 
 func readProcessPID(path string) int {
@@ -1677,6 +1777,35 @@ button, select, input {
 button { cursor: pointer; }
 button:hover { border-color: var(--accent); }
 button.danger:hover { border-color: var(--bad); }
+.terminal {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+.terminal input {
+  flex: 1;
+  min-width: 220px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.command-output {
+  display: none;
+  margin-top: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #0b0d0f;
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  max-height: 120px;
+  overflow: auto;
+  padding: 6px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.command-response {
+  color: var(--muted);
+  padding: 4px 6px;
+}
 pre {
   margin: 0;
   background: #0b0d0f;
@@ -1751,21 +1880,35 @@ canvas { width: 100%; height: 160px; display: block; }
       <div class="row" style="justify-content: space-between; margin-bottom: 10px;">
         <h2 style="margin:0">Logs</h2>
         <div class="row">
-          <select id="logTarget" onchange="loadLogs()">
-            <option value="server">server latest.log</option>
-            <option value="minecraft">supervised minecraft</option>
+          <select id="logTarget" onchange="startLogPolling()">
+            <option value="server">server live</option>
+            <option value="latest">server latest.log</option>
             <option value="playit">playit</option>
             <option value="supervisor">monitor</option>
           </select>
-          <input id="logSearch" placeholder="Search latest 200 lines" oninput="loadLogs()">
+          <input id="logSearch" placeholder="Search latest 200 lines" oninput="queueLogPollingRestart()">
         </div>
       </div>
       <pre id="logs">Loading...</pre>
+      <form class="terminal" onsubmit="sendCommand(event)">
+        <input id="commandInput" autocomplete="off" spellcheck="false" placeholder="/say hello">
+        <button id="commandSend" type="submit">Send</button>
+      </form>
+      <div class="command-output" id="commandOutput"></div>
     </div>
   </section>
 </main>
 <script>
 const $ = id => document.getElementById(id);
+const maxLogLines = 200;
+let logLines = [];
+let logPollTimer = null;
+let logPollInFlight = 0;
+let logPollGeneration = 0;
+let logRestartTimer = null;
+const commandStorageKey = 'mc-command-history';
+let commandHistory = loadCommandHistory();
+let commandHistoryIndex = commandHistory.length;
 
 async function json(url, opts) {
   const res = await fetch(url, opts);
@@ -1808,14 +1951,132 @@ async function refreshAll() {
   }
 }
 
-async function loadLogs() {
+async function loadLogs(forceBottom, generation) {
+  if (logPollInFlight === generation) return;
+  logPollInFlight = generation;
   const target = $('logTarget').value;
   const q = encodeURIComponent($('logSearch').value);
   try {
-    const data = await json('/api/logs?target=' + target + '&q=' + q);
-    $('logs').textContent = data.lines.join('\n');
+    const data = await json('/api/logs?target=' + target + '&q=' + q + '&_=' + Date.now(), { cache: 'no-store' });
+    if (generation !== logPollGeneration) return;
+    const nextLines = Array.isArray(data.lines) ? data.lines.slice(-maxLogLines) : [];
+    const nextPayload = nextLines.join('\n');
+    if (forceBottom || nextPayload !== logLines.join('\n')) {
+      logLines = nextLines;
+      renderLogs(forceBottom);
+    }
   } catch (e) {
-    $('logs').textContent = e.message;
+    if (generation === logPollGeneration) {
+      $('logs').textContent = e.message;
+    }
+  } finally {
+    if (logPollInFlight === generation) {
+      logPollInFlight = 0;
+    }
+  }
+}
+
+function queueLogPollingRestart() {
+  clearTimeout(logRestartTimer);
+  logRestartTimer = setTimeout(startLogPolling, 250);
+}
+
+function startLogPolling() {
+  clearTimeout(logRestartTimer);
+  clearInterval(logPollTimer);
+  logPollGeneration++;
+  logPollInFlight = 0;
+  const generation = logPollGeneration;
+  loadLogs(true, generation);
+  logPollTimer = setInterval(() => loadLogs(false, generation), 250);
+}
+
+function renderLogs(forceBottom) {
+  const el = $('logs');
+  const pinned = el.scrollTop + el.clientHeight >= el.scrollHeight - 24;
+  el.textContent = logLines.join('\n');
+  if (forceBottom || pinned) {
+    el.scrollTop = el.scrollHeight;
+  }
+}
+
+function loadCommandHistory() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(commandStorageKey) || '[]');
+    return Array.isArray(parsed) ? parsed.filter(v => typeof v === 'string').slice(-50) : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function saveCommandHistory() {
+  localStorage.setItem(commandStorageKey, JSON.stringify(commandHistory.slice(-50)));
+}
+
+function rememberCommand(command) {
+  commandHistory = commandHistory.filter(item => item !== command);
+  commandHistory.push(command);
+  commandHistory = commandHistory.slice(-50);
+  commandHistoryIndex = commandHistory.length;
+  saveCommandHistory();
+}
+
+function escapeHTML(value) {
+  return value.replace(/[&<>"']/g, ch => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  }[ch]));
+}
+
+function handleCommandKey(event) {
+  const input = event.currentTarget;
+  if (event.key === 'ArrowUp') {
+    if (commandHistory.length === 0) return;
+    event.preventDefault();
+    commandHistoryIndex = Math.max(0, commandHistoryIndex - 1);
+    input.value = commandHistory[commandHistoryIndex] || '';
+    input.setSelectionRange(input.value.length, input.value.length);
+  } else if (event.key === 'ArrowDown') {
+    if (commandHistory.length === 0) return;
+    event.preventDefault();
+    commandHistoryIndex = Math.min(commandHistory.length, commandHistoryIndex + 1);
+    input.value = commandHistory[commandHistoryIndex] || '';
+    input.setSelectionRange(input.value.length, input.value.length);
+  }
+}
+
+async function sendCommand(event) {
+  event.preventDefault();
+  const input = $('commandInput');
+  const button = $('commandSend');
+  const output = $('commandOutput');
+  const command = input.value.trim();
+  if (!command) return;
+
+  input.disabled = true;
+  button.disabled = true;
+  output.style.display = 'block';
+  output.innerHTML = '<div class="command-response">&gt; ' + escapeHTML(command) + '</div>';
+  try {
+    const data = await json('/api/command', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command })
+    });
+    const body = data.output ? data.output : '(no output)';
+    output.innerHTML = '<div class="command-response">&gt; ' + escapeHTML(data.command) + '\n' + escapeHTML(body) + '</div>';
+    rememberCommand(command);
+    input.value = '';
+    loadLogs(false, logPollGeneration);
+  } catch (e) {
+    output.innerHTML = '<div class="command-response">Error: ' + escapeHTML(e.message) + '</div>';
+  } finally {
+    input.disabled = false;
+    button.disabled = false;
+    input.focus();
   }
 }
 
@@ -1862,9 +2123,9 @@ function drawLine(ctx, values, color) {
 }
 
 refreshAll();
-loadLogs();
+$('commandInput').addEventListener('keydown', handleCommandKey);
+startLogPolling();
 setInterval(refreshAll, 5000);
-setInterval(loadLogs, 10000);
 </script>
 </body>
 </html>`))
