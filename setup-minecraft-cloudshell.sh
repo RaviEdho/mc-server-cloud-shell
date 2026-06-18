@@ -10,7 +10,7 @@ REUSE=0
 FORCE=0
 SKIP_PLAYIT_CLAIM=0
 START_MONITOR=1
-UPDATE_AUTOSTART=0
+UPDATE_MONITOR=0
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SETUP_DIR=""
@@ -39,13 +39,14 @@ Options:
   --force                   Move an existing install directory aside as a timestamped backup.
   --skip-playit-claim       Skip interactive playit CLI claim flow.
   --no-start                Do not start the monitor at the end.
-  --update-autostart        Update/rebuild and restart only the autostart monitor.
+  --update-monitor          Update/rebuild and restart only the web monitor.
+  --update-autostart        Backward-compatible alias for --update-monitor.
   -h, --help                Show this help.
 
 Examples:
   ./setup-minecraft-cloudshell.sh --agree-eula
   ./setup-minecraft-cloudshell.sh --mc-version 1.21.6 --agree-eula
-  ./setup-minecraft-cloudshell.sh --update-autostart
+  ./setup-minecraft-cloudshell.sh --update-monitor
 USAGE
 }
 
@@ -83,8 +84,8 @@ while [[ $# -gt 0 ]]; do
       START_MONITOR=0
       shift
       ;;
-    --update-autostart)
-      UPDATE_AUTOSTART=1
+    --update-monitor|--update-autostart)
+      UPDATE_MONITOR=1
       shift
       ;;
     -h|--help)
@@ -458,14 +459,14 @@ setup_playit_claim() {
 }
 
 install_monitor() {
-  update_autostart_program
-  MC_AUTOSTART_ROOT="$INSTALL_DIR" "$INSTALL_DIR/cloudshell-mc-autostart" -mode configure
+  update_monitor_program
+  MC_MONITOR_ROOT="$INSTALL_DIR" "$INSTALL_DIR/cloudshell-mc-monitor" -configure
 }
 
-update_autostart_program() {
-  local go_source="$SCRIPT_DIR/cloudshell-mc-autostart.go"
-  local installed_source="$INSTALL_DIR/cloudshell-mc-autostart.go"
-  local installed_binary="$INSTALL_DIR/cloudshell-mc-autostart"
+update_monitor_program() {
+  local go_source="$SCRIPT_DIR/cloudshell-mc-monitor.go"
+  local installed_source="$INSTALL_DIR/cloudshell-mc-monitor.go"
+  local installed_binary="$INSTALL_DIR/cloudshell-mc-monitor"
   local source_updated=0
   local rebuilt=0
 
@@ -491,7 +492,19 @@ update_autostart_program() {
   fi
 
   if [[ "$source_updated" -eq 0 && "$rebuilt" -eq 0 ]]; then
-    log "No autostart monitor update needed."
+    log "No monitor update needed."
+  fi
+
+  cleanup_legacy_monitor_files
+}
+
+cleanup_legacy_monitor_files() {
+  local legacy_source="$INSTALL_DIR/cloudshell-mc-autostart.go"
+  local legacy_binary="$INSTALL_DIR/cloudshell-mc-autostart"
+
+  if [[ -e "$legacy_source" || -e "$legacy_binary" ]]; then
+    log "Removing legacy monitor filenames."
+    rm -f "$legacy_source" "$legacy_binary"
   fi
 }
 
@@ -504,6 +517,8 @@ install_bashrc_hook() {
   touch "$bashrc"
 
   awk '
+    /# >>> minecraft-cloudshell-monitor >>>/ {skip=1; next}
+    /# <<< minecraft-cloudshell-monitor <<</ {skip=0; next}
     /# >>> minecraft-cloudshell-autostart >>>/ {skip=1; next}
     /# <<< minecraft-cloudshell-autostart <<</ {skip=0; next}
     !skip {print}
@@ -511,11 +526,11 @@ install_bashrc_hook() {
 
   local block
   block="$(cat <<EOF
-# >>> minecraft-cloudshell-autostart >>>
-if [ -x "$INSTALL_DIR/cloudshell-mc-autostart" ]; then
-  MC_AUTOSTART_ROOT="$INSTALL_DIR" "$INSTALL_DIR/cloudshell-mc-autostart" -mode start >/dev/null 2>&1
+# >>> minecraft-cloudshell-monitor >>>
+if [ -x "$INSTALL_DIR/cloudshell-mc-monitor" ]; then
+  MC_MONITOR_ROOT="$INSTALL_DIR" "$INSTALL_DIR/cloudshell-mc-monitor" -start >/dev/null 2>&1
 fi
-# <<< minecraft-cloudshell-autostart <<<
+# <<< minecraft-cloudshell-monitor <<<
 EOF
 )"
 
@@ -549,12 +564,12 @@ start_and_verify_monitor() {
     return 0
   fi
 
-  MC_AUTOSTART_ROOT="$INSTALL_DIR" "$INSTALL_DIR/cloudshell-mc-autostart" -mode stop >/dev/null 2>&1 || true
+  MC_MONITOR_ROOT="$INSTALL_DIR" "$INSTALL_DIR/cloudshell-mc-monitor" -stop >/dev/null 2>&1 || true
   sleep 2
   check_port_available 8080
   check_port_available 25565
   check_port_available 25575
-  MC_AUTOSTART_ROOT="$INSTALL_DIR" "$INSTALL_DIR/cloudshell-mc-autostart" -mode start
+  MC_MONITOR_ROOT="$INSTALL_DIR" "$INSTALL_DIR/cloudshell-mc-monitor" -start
 
   local status_url="http://127.0.0.1:8080/api/status"
   for _ in $(seq 1 90); do
@@ -572,23 +587,25 @@ start_and_verify_monitor() {
   die "Monitor started, but Minecraft did not become healthy in time."
 }
 
-update_autostart_only() {
+update_monitor_only() {
   require_command bash
   require_command cp
   require_command chmod
   require_command go
   require_command mkdir
+  require_command rm
 
   [[ -d "$INSTALL_DIR" ]] || die "Install directory does not exist: $INSTALL_DIR"
-  update_autostart_program
+  update_monitor_program
+  install_bashrc_hook
   log "Restarting monitor without stopping Minecraft."
-  MC_AUTOSTART_ROOT="$INSTALL_DIR" "$INSTALL_DIR/cloudshell-mc-autostart" -mode restart-monitor
-  log "Autostart monitor update complete."
+  MC_MONITOR_ROOT="$INSTALL_DIR" "$INSTALL_DIR/cloudshell-mc-monitor" -restart monitor
+  log "Monitor update complete."
 }
 
 main() {
-  if [[ "$UPDATE_AUTOSTART" -eq 1 ]]; then
-    update_autostart_only
+  if [[ "$UPDATE_MONITOR" -eq 1 ]]; then
+    update_monitor_only
     return 0
   fi
 
@@ -617,9 +634,9 @@ Dashboard:
 
 Useful commands:
   cd "$INSTALL_DIR"
-  ./cloudshell-mc-autostart -mode status
-  ./cloudshell-mc-autostart -mode stop
-  ./cloudshell-mc-autostart -mode start
+  ./cloudshell-mc-monitor -status
+  ./cloudshell-mc-monitor -stop
+  ./cloudshell-mc-monitor -start
 
 Logs:
   tail -f "$INSTALL_DIR/.runtime/supervisor.log"

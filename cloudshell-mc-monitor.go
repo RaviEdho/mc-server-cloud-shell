@@ -151,7 +151,13 @@ type commandRequest struct {
 }
 
 func main() {
-	mode := flag.String("mode", "start", "start, daemon, stop, restart-monitor, status, or configure")
+	mode := flag.String("mode", "", "start, daemon, stop, restart-monitor, status, or configure")
+	startFlag := flag.Bool("start", false, "start the monitor daemon")
+	daemonFlag := flag.Bool("daemon", false, "run the monitor in the foreground")
+	stopFlag := flag.Bool("stop", false, "stop the monitor and supervised services")
+	statusFlag := flag.Bool("status", false, "print monitor status")
+	configureFlag := flag.Bool("configure", false, "reapply server.properties RCON/query settings")
+	restartFlag := flag.Bool("restart", false, "restart all services or a target: all, monitor, minecraft, playit")
 	flag.Parse()
 
 	cfg, err := loadConfig()
@@ -159,7 +165,19 @@ func main() {
 		fatal(err)
 	}
 
-	switch *mode {
+	action, _, err := resolveCLIAction(*mode, flag.Args(), map[string]bool{
+		"start":     *startFlag,
+		"daemon":    *daemonFlag,
+		"stop":      *stopFlag,
+		"status":    *statusFlag,
+		"configure": *configureFlag,
+		"restart":   *restartFlag,
+	})
+	if err != nil {
+		fatal(err)
+	}
+
+	switch action {
 	case "start":
 		err = startDaemon(cfg)
 	case "daemon":
@@ -168,15 +186,102 @@ func main() {
 		err = stopDaemon(cfg)
 	case "restart-monitor":
 		err = restartMonitor(cfg)
+	case "restart-all":
+		err = restartAll(cfg)
+	case "restart-minecraft":
+		err = restartManagedService(cfg, "minecraft")
+	case "restart-playit":
+		err = restartManagedService(cfg, "playit")
 	case "status":
 		err = status(cfg)
 	case "configure":
 		err = ensureServerProperties(cfg)
 	default:
-		err = fmt.Errorf("unknown mode %q", *mode)
+		err = fmt.Errorf("unknown action %q", action)
 	}
 	if err != nil {
 		fatal(err)
+	}
+}
+
+func resolveCLIAction(mode string, args []string, flags map[string]bool) (string, string, error) {
+	selected := 0
+	for _, enabled := range flags {
+		if enabled {
+			selected++
+		}
+	}
+	if mode != "" {
+		selected++
+	}
+	if selected > 1 {
+		return "", "", errors.New("choose only one command flag")
+	}
+	if mode != "" {
+		if len(args) > 0 {
+			return "", "", fmt.Errorf("-mode %s does not accept extra arguments", mode)
+		}
+		if mode == "restart-monitor" {
+			return "restart-monitor", "", nil
+		}
+		return mode, "", nil
+	}
+
+	switch {
+	case flags["start"]:
+		return simpleCLIAction("start", args)
+	case flags["daemon"]:
+		return simpleCLIAction("daemon", args)
+	case flags["stop"]:
+		return simpleCLIAction("stop", args)
+	case flags["status"]:
+		return simpleCLIAction("status", args)
+	case flags["configure"]:
+		return simpleCLIAction("configure", args)
+	case flags["restart"]:
+		target, err := cliTarget(args, "all")
+		if err != nil {
+			return "", "", err
+		}
+		action, err := restartActionForTarget(target)
+		return action, target, err
+	default:
+		if len(args) > 0 {
+			return "", "", fmt.Errorf("unknown command argument %q", args[0])
+		}
+		return "start", "", nil
+	}
+}
+
+func simpleCLIAction(action string, args []string) (string, string, error) {
+	if len(args) > 0 {
+		return "", "", fmt.Errorf("-%s does not accept extra arguments", action)
+	}
+	return action, "", nil
+}
+
+func cliTarget(args []string, fallback string) (string, error) {
+	if len(args) == 0 {
+		return fallback, nil
+	}
+	if len(args) > 1 {
+		return "", fmt.Errorf("expected one restart target, got %d", len(args))
+	}
+	return strings.ToLower(strings.TrimSpace(args[0])), nil
+}
+
+func restartActionForTarget(target string) (string, error) {
+	switch target {
+	case "", "all":
+		return "restart-all", nil
+	case "mon", "monitor", "web":
+		return "restart-monitor", nil
+	case "minecraft", "mc", "server":
+		return "restart-minecraft", nil
+	case "playit", "conn", "connection":
+		return "restart-playit", nil
+	default:
+		return "", fmt.Errorf("unknown restart target %q", target)
 	}
 }
 
@@ -185,7 +290,10 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
-	root := os.Getenv("MC_AUTOSTART_ROOT")
+	root := os.Getenv("MC_MONITOR_ROOT")
+	if root == "" {
+		root = os.Getenv("MC_AUTOSTART_ROOT")
+	}
 	if root == "" {
 		root = filepath.Dir(exe)
 	}
@@ -271,7 +379,7 @@ func startDaemon(cfg config) error {
 	}
 	defer logFile.Close()
 
-	cmd := exec.Command(exe, "-mode", "daemon")
+	cmd := exec.Command(exe, "-daemon")
 	cmd.Dir = cfg.root
 	cmd.Env = os.Environ()
 	cmd.Stdout = logFile
@@ -1501,6 +1609,60 @@ func restartMonitor(cfg config) error {
 		return startDaemon(cfg)
 	}
 	return fmt.Errorf("monitor PID %d did not exit after SIGKILL", pid)
+}
+
+func restartAll(cfg config) error {
+	pid, err := readPID(cfg)
+	if err != nil {
+		fmt.Println("Monitor is not running; starting it.")
+		return startDaemon(cfg)
+	}
+	if processRunning(pid) {
+		proc, err := os.FindProcess(pid)
+		if err != nil {
+			return err
+		}
+		if err := proc.Signal(syscall.SIGTERM); err != nil {
+			return err
+		}
+		fmt.Printf("Sent restart signal to monitor PID %d.\n", pid)
+		if !waitForProcessExit(pid, 60*time.Second) {
+			return fmt.Errorf("monitor PID %d did not exit after restart signal", pid)
+		}
+	}
+	_ = os.Remove(filepath.Join(cfg.runtimeDir, pidFileName))
+	return startDaemon(cfg)
+}
+
+func restartManagedService(cfg config, target string) error {
+	url := monitorActionURL(cfg, target, "restart")
+	req, err := http.NewRequest(http.MethodPost, url, nil)
+	if err != nil {
+		return err
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("restart %s through monitor failed: %w", target, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("restart %s through monitor failed: %s: %s", target, resp.Status, strings.TrimSpace(string(body)))
+	}
+	fmt.Printf("Requested %s restart through monitor.\n", target)
+	return nil
+}
+
+func monitorActionURL(cfg config, target string, action string) string {
+	host, port, err := net.SplitHostPort(cfg.webAddr)
+	if err != nil {
+		host = "127.0.0.1"
+		port = "8080"
+	} else if host == "" || host == "0.0.0.0" || host == "::" || host == "[::]" {
+		host = "127.0.0.1"
+	}
+	return "http://" + net.JoinHostPort(host, port) + "/api/" + target + "/" + action
 }
 
 func status(cfg config) error {

@@ -5,7 +5,7 @@ This scaffold bootstraps a Fabric Minecraft server in Google Cloud Shell, connec
 It is designed around two source files:
 
 - `setup-minecraft-cloudshell.sh`: one-time bootstrap script for a fresh Cloud Shell `$HOME`
-- `cloudshell-mc-autostart.go`: Go supervisor and web monitoring dashboard
+- `cloudshell-mc-monitor.go`: Go supervisor and web monitoring dashboard
 
 ## Quick Start
 
@@ -55,6 +55,8 @@ After setup completes, open Cloud Shell Web Preview on port `8080`.
 --force                    Move an existing install directory aside as a timestamped backup.
 --skip-playit-claim        Skip interactive playit CLI claim flow.
 --no-start                 Do not start the monitor at the end.
+--update-monitor           Update/rebuild and restart only the web monitor.
+--update-autostart         Backward-compatible alias for --update-monitor.
 -h, --help                 Show help.
 ```
 
@@ -161,7 +163,7 @@ If you already have a valid playit secret, the script reuses it.
 The Go monitor is built as:
 
 ```text
-~/minecraft-server/cloudshell-mc-autostart
+~/minecraft-server/cloudshell-mc-monitor
 ```
 
 It supervises:
@@ -181,11 +183,11 @@ It also creates:
 The setup script adds this managed block to `~/.bashrc`:
 
 ```bash
-# >>> minecraft-cloudshell-autostart >>>
-if [ -x "$HOME/minecraft-server/cloudshell-mc-autostart" ]; then
-  MC_AUTOSTART_ROOT="$HOME/minecraft-server" "$HOME/minecraft-server/cloudshell-mc-autostart" -mode start >/dev/null 2>&1
+# >>> minecraft-cloudshell-monitor >>>
+if [ -x "$HOME/minecraft-server/cloudshell-mc-monitor" ]; then
+  MC_MONITOR_ROOT="$HOME/minecraft-server" "$HOME/minecraft-server/cloudshell-mc-monitor" -start >/dev/null 2>&1
 fi
-# <<< minecraft-cloudshell-autostart <<<
+# <<< minecraft-cloudshell-monitor <<<
 ```
 
 That means a new Cloud Shell session starts the monitor automatically. Cloud Shell still cannot run while the Cloud Shell VM is stopped due to inactivity.
@@ -210,6 +212,8 @@ The dashboard shows:
 - TPS/MSPT
 - playit endpoint
 - recent/searchable logs
+- live Minecraft process logs
+- RCON command input and command response output
 
 It can also control:
 
@@ -242,6 +246,7 @@ The dashboard uses RCON for:
 list
 tick query
 stop
+dashboard command input
 ```
 
 The monitor keeps a persistent RCON connection and polls Minecraft health every 30 seconds, so it should not spam the Minecraft logs with repeated RCON connect/disconnect messages.
@@ -257,26 +262,73 @@ cd ~/minecraft-server
 Check status:
 
 ```bash
-./cloudshell-mc-autostart -mode status
+./cloudshell-mc-monitor -status
 ```
 
 Start monitor:
 
 ```bash
-./cloudshell-mc-autostart -mode start
+./cloudshell-mc-monitor -start
 ```
 
 Stop monitor:
 
 ```bash
-./cloudshell-mc-autostart -mode stop
+./cloudshell-mc-monitor -stop
+```
+
+Restart all services:
+
+```bash
+./cloudshell-mc-monitor -restart
+./cloudshell-mc-monitor -restart all
+```
+
+Restart only the web monitor without stopping Minecraft:
+
+```bash
+./cloudshell-mc-monitor -restart monitor
+./cloudshell-mc-monitor -restart mon
+./cloudshell-mc-monitor -restart web
+```
+
+Restart only Minecraft:
+
+```bash
+./cloudshell-mc-monitor -restart minecraft
+./cloudshell-mc-monitor -restart mc
+./cloudshell-mc-monitor -restart server
+```
+
+Restart only playit:
+
+```bash
+./cloudshell-mc-monitor -restart playit
+./cloudshell-mc-monitor -restart conn
+./cloudshell-mc-monitor -restart connection
 ```
 
 Apply RCON/query config again:
 
 ```bash
-./cloudshell-mc-autostart -mode configure
+./cloudshell-mc-monitor -configure
 ```
+
+The monitor helper supports these modes:
+
+```text
+-start                  Start the monitor daemon if it is not already running.
+-daemon                 Internal foreground mode used by start.
+-stop                   Stop the monitor, Minecraft server, and playit daemon.
+-restart [all]                    Restart the monitor, Minecraft server, and playit daemon.
+-restart monitor|mon|web          Restart only the web monitor process and keep Minecraft running.
+-restart minecraft|mc|server      Restart only Minecraft through the running monitor.
+-restart playit|conn|connection   Restart only the playit daemon through the running monitor.
+-status                 Print process and server status.
+-configure              Reapply server.properties RCON/query settings.
+```
+
+The older `-mode <action>` form still works for compatibility.
 
 ## Logs
 
@@ -330,7 +382,19 @@ Move the existing directory aside and create a fresh one:
 ./setup-minecraft-cloudshell.sh --force --agree-eula
 ```
 
-The `.bashrc` autostart block is idempotent. Rerunning the script replaces the old managed block instead of appending duplicates.
+Update only the monitor source/binary, refresh the `.bashrc` hook, and restart the web monitor without stopping Minecraft:
+
+```bash
+./setup-minecraft-cloudshell.sh --update-monitor
+```
+
+The old flag still works as an alias:
+
+```bash
+./setup-minecraft-cloudshell.sh --update-autostart
+```
+
+The `.bashrc` monitor block is idempotent. Rerunning the script replaces the old managed block instead of appending duplicates.
 
 ## Common Failure Cases
 
