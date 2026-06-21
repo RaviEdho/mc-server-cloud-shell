@@ -1,10 +1,13 @@
-# Minecraft Cloud Shell Server Scaffold
+# Minecraft Server Installer
 
-This scaffold bootstraps a Fabric Minecraft server in Google Cloud Shell, connects it through playit.gg, and installs a Go monitor that autostarts the server and exposes a Cloud Shell Web Preview dashboard.
+This project bootstraps a Fabric Minecraft server, connects it through playit.gg, and installs a monitor that supervises the server and exposes a web dashboard.
 
-It is designed around two source files:
+The current installer path supports Google Cloud Shell. The rewrite is moving toward a generic Ubuntu/Debian VM installer while keeping Cloud Shell supported.
 
-- `setup-minecraft-cloudshell.sh`: one-time bootstrap script for a fresh Cloud Shell `$HOME`
+It is currently organized around these main files:
+
+- `install.sh`: one-time bootstrap script for a fresh install
+- `setup-minecraft-cloudshell.sh`: legacy Cloud Shell installer entry point kept during the rewrite
 - `cloudshell-mc-monitor.go`: Go supervisor and web monitoring dashboard
 
 ## Quick Start
@@ -12,7 +15,7 @@ It is designed around two source files:
 Run the installer directly from GitHub:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/RaviEdho/mc-server-cloud-shell/master/setup-minecraft-cloudshell.sh | bash
+curl -fsSL https://raw.githubusercontent.com/RaviEdho/mc-server-cloud-shell/master/install.sh | bash
 ```
 
 The setup script downloads the monitor source when needed, reads interactive prompts from the terminal, and cleans up temporary installer files automatically.
@@ -20,21 +23,21 @@ The setup script downloads the monitor source when needed, reads interactive pro
 If you already cloned the repository, run:
 
 ```bash
-chmod +x setup-minecraft-cloudshell.sh
-./setup-minecraft-cloudshell.sh --agree-eula
+chmod +x install.sh
+./install.sh --agree-eula
 ```
 
 To install a specific Minecraft version:
 
 ```bash
-./setup-minecraft-cloudshell.sh --mc-version 1.21.6 --agree-eula
+./install.sh --mc-version 1.21.6 --agree-eula
 ```
 
 After setup completes, open Cloud Shell Web Preview on port `8080`.
 
 ## What The Setup Script Does
 
-`setup-minecraft-cloudshell.sh` performs the full bootstrap:
+`install.sh` performs the full bootstrap:
 
 1. Checks required commands and available disk space.
 2. Creates the install directory, defaulting to `~/minecraft-server`.
@@ -65,6 +68,8 @@ After setup completes, open Cloud Shell Web Preview on port `8080`.
 --no-start                 Do not start the monitor at the end.
 --update-monitor           Update/rebuild and restart only the web monitor.
 --update-autostart         Backward-compatible alias for --update-monitor.
+--platform PLATFORM        Platform override. Current values: auto, cloudshell.
+--service MODE             Service mode. Current values: auto, bashrc.
 -h, --help                 Show help.
 ```
 
@@ -89,7 +94,7 @@ newer/future versions  Java 25
 You can override this with:
 
 ```bash
-./setup-minecraft-cloudshell.sh --java-major 25 --agree-eula
+./install.sh --java-major 25 --agree-eula
 ```
 
 The script then asks SDKMAN for a matching Java candidate, preferring Temurin builds when available.
@@ -124,7 +129,7 @@ The script does not silently accept the Minecraft EULA.
 Use:
 
 ```bash
-./setup-minecraft-cloudshell.sh --agree-eula
+./install.sh --agree-eula
 ```
 
 only if you agree to:
@@ -381,25 +386,25 @@ If `~/minecraft-server` already exists and is non-empty, the script refuses to c
 Reuse the existing directory:
 
 ```bash
-./setup-minecraft-cloudshell.sh --reuse --agree-eula
+./install.sh --reuse --agree-eula
 ```
 
 Move the existing directory aside and create a fresh one:
 
 ```bash
-./setup-minecraft-cloudshell.sh --force --agree-eula
+./install.sh --force --agree-eula
 ```
 
 Update only the monitor source/binary, refresh the `.bashrc` hook, and restart the web monitor without stopping Minecraft:
 
 ```bash
-./setup-minecraft-cloudshell.sh --update-monitor
+./install.sh --update-monitor
 ```
 
 The old flag still works as an alias:
 
 ```bash
-./setup-minecraft-cloudshell.sh --update-autostart
+./install.sh --update-autostart
 ```
 
 The `.bashrc` monitor block is idempotent. Rerunning the script replaces the old managed block instead of appending duplicates.
