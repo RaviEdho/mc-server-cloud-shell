@@ -17,6 +17,7 @@ ACTIVE_PLATFORM=""
 ACTIVE_SERVICE_MODE=""
 DETECTED_OS_ID=""
 DETECTED_OS_LIKE=""
+SYSTEMD_SERVICE_NAME="minecraft-monitor.service"
 
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
 if [[ -n "$SCRIPT_SOURCE" && -f "$SCRIPT_SOURCE" ]]; then
@@ -192,6 +193,10 @@ trap cleanup EXIT
 
 # Platform/service selection
 
+systemd_user_available() {
+  command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1
+}
+
 read_os_release() {
   DETECTED_OS_ID=""
   DETECTED_OS_LIKE=""
@@ -270,7 +275,11 @@ resolve_service_mode() {
           ACTIVE_SERVICE_MODE="bashrc"
           ;;
         generic-linux)
-          ACTIVE_SERVICE_MODE="systemd-user"
+          if systemd_user_available; then
+            ACTIVE_SERVICE_MODE="systemd-user"
+          else
+            ACTIVE_SERVICE_MODE="none"
+          fi
           ;;
         *)
           ACTIVE_SERVICE_MODE="none"
@@ -291,7 +300,10 @@ resolve_service_mode() {
 
 validate_platform_service_mode() {
   case "$ACTIVE_PLATFORM:$ACTIVE_SERVICE_MODE" in
-    cloudshell:bashrc|generic-linux:systemd-user|generic-linux:none)
+    cloudshell:bashrc|generic-linux:none)
+      ;;
+    generic-linux:systemd-user)
+      systemd_user_available || die "systemd --user is not available. Re-run with --service none to use manual scripts."
       ;;
     cloudshell:systemd-user|cloudshell:none)
       die "Service mode '$ACTIVE_SERVICE_MODE' is not supported for Cloud Shell in this phase."
@@ -308,7 +320,7 @@ require_supported_install_platform() {
       return 0
       ;;
     generic-linux)
-      die "Generic Linux was detected, but install support starts in Phase 4."
+      return 0
       ;;
     unknown-linux)
       die "Unsupported Linux distribution. Phase 4 starts with Ubuntu/Debian only."
@@ -351,7 +363,7 @@ platform_install_autostart() {
       install_bashrc_hook
       ;;
     generic-linux:systemd-user|generic-linux:none)
-      die "Generic Linux service setup starts in Phase 4."
+      install_generic_linux_service
       ;;
     *)
       die "Unsupported service mode '$ACTIVE_SERVICE_MODE' for platform '$ACTIVE_PLATFORM'."
@@ -382,6 +394,15 @@ EOF
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+}
+
+run_privileged() {
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    "$@"
+  else
+    require_command sudo
+    sudo "$@"
+  fi
 }
 
 download() {
@@ -573,7 +594,35 @@ select_sdkman_java_identifier() {
   printf '%s\n' "$id"
 }
 
-install_java() {
+verify_java_install() {
+  local java_output
+  java_output="$(java -version 2>&1)" || die "java -version failed after installing Java: $java_output"
+  printf '%s\n' "$java_output" | tee "$SETUP_DIR/java-version.txt"
+  printf '%s\n' "$java_output" | grep -Eq "version \"(${JAVA_MAJOR}\\.|1\\.${JAVA_MAJOR}\\.)" || {
+    log "Warning: could not prove Java major $JAVA_MAJOR from java -version output."
+  }
+}
+
+install_java_with_apt() {
+  [[ "$ACTIVE_PLATFORM" == "generic-linux" ]] || return 1
+  command -v apt-get >/dev/null 2>&1 || return 1
+  command -v apt-cache >/dev/null 2>&1 || return 1
+
+  local package="openjdk-${JAVA_MAJOR}-jdk-headless"
+  if ! apt-cache show "$package" >/dev/null 2>&1; then
+    log "APT package $package is not available; falling back to SDKMAN."
+    return 1
+  fi
+
+  log "Installing Java with APT package: $package"
+  run_privileged apt-get update
+  run_privileged apt-get install -y "$package"
+  hash -r
+  verify_java_install
+}
+
+install_java_with_sdkman() {
+  install_sdkman
   JAVA_IDENTIFIER="$(select_sdkman_java_identifier "$JAVA_MAJOR")"
   log "Installing/selecting Java candidate: $JAVA_IDENTIFIER"
   set +u
@@ -583,12 +632,15 @@ install_java() {
   set -u
   hash -r
 
-  local java_output
-  java_output="$(java -version 2>&1)" || die "java -version failed after installing $JAVA_IDENTIFIER: $java_output"
-  printf '%s\n' "$java_output" | tee "$SETUP_DIR/java-version.txt"
-  printf '%s\n' "$java_output" | grep -Eq "version \"(${JAVA_MAJOR}\\.|1\\.${JAVA_MAJOR}\\.)" || {
-    log "Warning: could not prove Java major $JAVA_MAJOR from java -version output."
-  }
+  verify_java_install
+}
+
+install_java() {
+  if install_java_with_apt; then
+    return 0
+  fi
+
+  install_java_with_sdkman
 }
 
 # Minecraft/Fabric installation
@@ -852,11 +904,141 @@ EOF
   rm -f "$tmp" "$tmp2"
 }
 
+systemd_quote() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "$value"
+}
+
+install_control_scripts() {
+  local monitor="$INSTALL_DIR/cloudshell-mc-monitor"
+  local addr="${1:-127.0.0.1:8080}"
+
+  cat > "$INSTALL_DIR/start.sh" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT="\$(cd -- "\$(dirname -- "\${BASH_SOURCE[0]}")" && pwd)"
+export MC_MONITOR_ROOT="\$ROOT"
+export MC_MONITOR_ADDR="\${MC_MONITOR_ADDR:-$addr}"
+exec "\$ROOT/cloudshell-mc-monitor" -start
+EOF
+
+  cat > "$INSTALL_DIR/stop.sh" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+export MC_MONITOR_ROOT="$ROOT"
+exec "$ROOT/cloudshell-mc-monitor" -stop
+EOF
+
+  cat > "$INSTALL_DIR/status.sh" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT="\$(cd -- "\$(dirname -- "\${BASH_SOURCE[0]}")" && pwd)"
+export MC_MONITOR_ROOT="\$ROOT"
+export MC_MONITOR_ADDR="\${MC_MONITOR_ADDR:-$addr}"
+exec "\$ROOT/cloudshell-mc-monitor" -status
+EOF
+
+  chmod +x "$INSTALL_DIR/start.sh" "$INSTALL_DIR/stop.sh" "$INSTALL_DIR/status.sh"
+  [[ -x "$monitor" ]] || die "Monitor binary is not executable: $monitor"
+}
+
+install_systemd_user_service() {
+  systemd_user_available || die "systemd --user is not available. Re-run with --service none to use manual scripts."
+
+  local service_dir="$HOME/.config/systemd/user"
+  local service_path="$service_dir/$SYSTEMD_SERVICE_NAME"
+  local monitor="$INSTALL_DIR/cloudshell-mc-monitor"
+
+  mkdir -p "$service_dir"
+  cat > "$service_path" <<EOF
+[Unit]
+Description=Minecraft server monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$(systemd_quote "$INSTALL_DIR")
+Environment=$(systemd_quote "MC_MONITOR_ROOT=$INSTALL_DIR")
+Environment=$(systemd_quote "MC_MONITOR_ADDR=127.0.0.1:8080")
+ExecStart=$(systemd_quote "$monitor") -daemon
+ExecStop=$(systemd_quote "$monitor") -stop
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+
+[Install]
+WantedBy=default.target
+EOF
+
+  systemctl --user daemon-reload
+  systemctl --user enable "$SYSTEMD_SERVICE_NAME"
+  log "Installed systemd user service: $service_path"
+}
+
+install_generic_linux_service() {
+  install_control_scripts "127.0.0.1:8080"
+
+  if [[ "$ACTIVE_SERVICE_MODE" == "systemd-user" ]]; then
+    install_systemd_user_service
+  else
+    log "Skipping systemd service setup; use $INSTALL_DIR/start.sh to start the monitor."
+  fi
+}
+
 check_port_available() {
   local port="$1"
   if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${port}$"; then
     die "Port $port is already in use."
   fi
+}
+
+platform_stop_monitor() {
+  case "$ACTIVE_PLATFORM:$ACTIVE_SERVICE_MODE" in
+    generic-linux:systemd-user)
+      systemctl --user stop "$SYSTEMD_SERVICE_NAME" >/dev/null 2>&1 || true
+      ;;
+    *)
+      MC_MONITOR_ROOT="$INSTALL_DIR" "$INSTALL_DIR/cloudshell-mc-monitor" -stop >/dev/null 2>&1 || true
+      ;;
+  esac
+}
+
+platform_start_monitor() {
+  case "$ACTIVE_PLATFORM:$ACTIVE_SERVICE_MODE" in
+    generic-linux:systemd-user)
+      systemctl --user start "$SYSTEMD_SERVICE_NAME"
+      ;;
+    generic-linux:none)
+      MC_MONITOR_ROOT="$INSTALL_DIR" MC_MONITOR_ADDR="127.0.0.1:8080" "$INSTALL_DIR/cloudshell-mc-monitor" -start
+      ;;
+    cloudshell:bashrc)
+      MC_MONITOR_ROOT="$INSTALL_DIR" "$INSTALL_DIR/cloudshell-mc-monitor" -start
+      ;;
+    *)
+      die "Unsupported monitor start mode: $ACTIVE_PLATFORM/$ACTIVE_SERVICE_MODE"
+      ;;
+  esac
+}
+
+platform_restart_monitor_only() {
+  case "$ACTIVE_PLATFORM:$ACTIVE_SERVICE_MODE" in
+    generic-linux:systemd-user)
+      systemctl --user restart "$SYSTEMD_SERVICE_NAME"
+      ;;
+    generic-linux:none)
+      MC_MONITOR_ROOT="$INSTALL_DIR" MC_MONITOR_ADDR="127.0.0.1:8080" "$INSTALL_DIR/cloudshell-mc-monitor" -restart monitor
+      ;;
+    cloudshell:bashrc)
+      MC_MONITOR_ROOT="$INSTALL_DIR" "$INSTALL_DIR/cloudshell-mc-monitor" -restart monitor
+      ;;
+    *)
+      die "Unsupported monitor restart mode: $ACTIVE_PLATFORM/$ACTIVE_SERVICE_MODE"
+      ;;
+  esac
 }
 
 # Verification and entry points
@@ -867,12 +1049,12 @@ start_and_verify_monitor() {
     return 0
   fi
 
-  MC_MONITOR_ROOT="$INSTALL_DIR" "$INSTALL_DIR/cloudshell-mc-monitor" -stop >/dev/null 2>&1 || true
+  platform_stop_monitor
   sleep 2
   check_port_available 8080
   check_port_available 25565
   check_port_available 25575
-  MC_MONITOR_ROOT="$INSTALL_DIR" "$INSTALL_DIR/cloudshell-mc-monitor" -start
+  platform_start_monitor
 
   local status_url="http://127.0.0.1:8080/api/status"
   for _ in $(seq 1 90); do
@@ -904,7 +1086,7 @@ update_monitor_only() {
   update_monitor_program
   platform_install_autostart
   log "Restarting monitor without stopping Minecraft."
-  MC_MONITOR_ROOT="$INSTALL_DIR" "$INSTALL_DIR/cloudshell-mc-monitor" -restart monitor
+  platform_restart_monitor_only
   log "Monitor update complete."
 }
 
@@ -919,7 +1101,6 @@ main() {
 
   check_prerequisites
   prepare_install_dir
-  install_sdkman
   resolve_minecraft_metadata
   install_java
   download_fabric_installer

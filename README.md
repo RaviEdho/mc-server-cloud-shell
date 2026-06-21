@@ -73,7 +73,29 @@ After setup completes, open Cloud Shell Web Preview on port `8080`.
 -h, --help                 Show help.
 ```
 
-Generic Linux and `systemd-user` service mode are detected by the rewrite scaffold, but full generic Linux install support starts in a later phase.
+On generic Linux, `auto` uses `systemd-user` when a user systemd session is available and falls back to manual scripts otherwise. The generic Linux path still uses the current Go monitor until the Python monitor replacement phase.
+
+## Generic Linux Service Modes
+
+On Ubuntu/Debian-style Linux, the installer writes manual control scripts into the install directory:
+
+```text
+~/minecraft-server/start.sh
+~/minecraft-server/stop.sh
+~/minecraft-server/status.sh
+```
+
+When `systemd --user` is available, `--service auto` installs and enables:
+
+```text
+~/.config/systemd/user/minecraft-monitor.service
+```
+
+The generic Linux dashboard binds to `127.0.0.1:8080` by default. Use SSH local port forwarding to view it without opening a public dashboard port:
+
+```bash
+ssh -L 8080:127.0.0.1:8080 user@server
+```
 
 ## Java Version Resolution
 

@@ -468,13 +468,13 @@ These are now decided:
 8. The generic Linux dashboard binds to `127.0.0.1:8080` by default.
 9. SSH local port forwarding is the primary documented dashboard access path for generic Linux.
 10. Public dashboard exposure is opt-in only and should require authentication first.
+11. Generic Linux Java installation should use `sudo apt-get install` automatically when the required package is available.
+12. Rewrite work continues on the `rewrite-generic-installer` branch.
 
 Remaining decisions before implementation:
 
 1. Which Ubuntu/Debian releases are the first supported targets?
-2. Should the installer use `sudo apt install` automatically after confirmation, or only print the commands the user should run?
-3. Should playit be mandatory for the default install, or can users choose local-only setup?
-4. Should the rewrite happen in-place on `master`, or on a long-running rewrite branch?
+2. Should playit be mandatory for the default install, or can users choose local-only setup?
 
 ## Recommended Starting Point
 

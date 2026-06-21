@@ -61,7 +61,7 @@ The current installer behavior should continue to support:
 -h, --help
 ```
 
-`--platform generic-linux`, `--service systemd-user`, and `--service none` are recognized by the Phase 3 platform skeleton. Generic Linux install and service setup still stop before making install changes until Phase 4 implements that path.
+`--platform generic-linux`, `--service systemd-user`, and `--service none` are supported by the Phase 4 service path. Generic Linux uses `systemd --user` when available and installs `start.sh`, `stop.sh`, and `status.sh` as manual fallbacks.
 
 ## Dashboard And Monitor
 
