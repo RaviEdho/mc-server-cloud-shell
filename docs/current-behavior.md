@@ -56,12 +56,12 @@ The current installer behavior should continue to support:
 --no-start
 --update-monitor
 --update-autostart
---platform auto|cloudshell
---service auto|bashrc
+--platform auto|cloudshell|generic-linux
+--service auto|bashrc|systemd-user|none
 -h, --help
 ```
 
-`--platform generic-linux`, `--service systemd-user`, and `--service none` are planned for later phases.
+`--platform generic-linux`, `--service systemd-user`, and `--service none` are recognized by the Phase 3 platform skeleton. Generic Linux install and service setup still stop before making install changes until Phase 4 implements that path.
 
 ## Dashboard And Monitor
 

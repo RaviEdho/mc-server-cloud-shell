@@ -68,10 +68,12 @@ After setup completes, open Cloud Shell Web Preview on port `8080`.
 --no-start                 Do not start the monitor at the end.
 --update-monitor           Update/rebuild and restart only the web monitor.
 --update-autostart         Backward-compatible alias for --update-monitor.
---platform PLATFORM        Platform override. Current values: auto, cloudshell.
---service MODE             Service mode. Current values: auto, bashrc.
+--platform PLATFORM        Platform override. Values: auto, cloudshell, generic-linux.
+--service MODE             Service mode. Values: auto, bashrc, systemd-user, none.
 -h, --help                 Show help.
 ```
+
+Generic Linux and `systemd-user` service mode are detected by the rewrite scaffold, but full generic Linux install support starts in a later phase.
 
 ## Java Version Resolution
 

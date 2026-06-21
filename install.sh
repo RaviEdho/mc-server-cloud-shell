@@ -14,6 +14,9 @@ UPDATE_MONITOR=0
 PLATFORM="auto"
 SERVICE_MODE="auto"
 ACTIVE_PLATFORM=""
+ACTIVE_SERVICE_MODE=""
+DETECTED_OS_ID=""
+DETECTED_OS_LIKE=""
 
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
 if [[ -n "$SCRIPT_SOURCE" && -f "$SCRIPT_SOURCE" ]]; then
@@ -104,8 +107,8 @@ Options:
   --no-start                Do not start the monitor at the end.
   --update-monitor          Update/rebuild and restart only the web monitor.
   --update-autostart        Backward-compatible alias for --update-monitor.
-  --platform PLATFORM       Platform override. Current values: auto, cloudshell.
-  --service MODE            Service mode. Current values: auto, bashrc.
+  --platform PLATFORM       Platform override. Values: auto, cloudshell, generic-linux.
+  --service MODE            Service mode. Values: auto, bashrc, systemd-user, none.
   -h, --help                Show this help.
 
 Examples:
@@ -187,20 +190,133 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Platform/service skeleton
+# Platform/service selection
+
+read_os_release() {
+  DETECTED_OS_ID=""
+  DETECTED_OS_LIKE=""
+
+  [[ -r /etc/os-release ]] || return 0
+
+  local key
+  local value
+  while IFS='=' read -r key value; do
+    value="${value%\"}"
+    value="${value#\"}"
+    case "$key" in
+      ID)
+        DETECTED_OS_ID="$value"
+        ;;
+      ID_LIKE)
+        DETECTED_OS_LIKE="$value"
+        ;;
+    esac
+  done < /etc/os-release
+}
+
+is_cloud_shell() {
+  [[ -n "${CLOUD_SHELL:-}" || -n "${DEVSHELL_PROJECT_ID:-}" || -d "/google/devshell" ]]
+}
+
+is_debian_like_linux() {
+  [[ "$(uname -s 2>/dev/null || true)" == "Linux" ]] || return 1
+  read_os_release
+
+  case "$DETECTED_OS_ID" in
+    debian|ubuntu)
+      return 0
+      ;;
+  esac
+
+  [[ " $DETECTED_OS_LIKE " == *" debian "* ]]
+}
 
 detect_platform() {
-  if [[ -n "${CLOUD_SHELL:-}" || -n "${DEVSHELL_PROJECT_ID:-}" || -d "/google/devshell" ]]; then
+  if is_cloud_shell; then
     printf 'cloudshell\n'
-    return 0
-  fi
-
-  if [[ "$(uname -s 2>/dev/null || true)" == "Linux" ]]; then
+  elif is_debian_like_linux; then
     printf 'generic-linux\n'
-    return 0
+  else
+    printf 'unknown-linux\n'
   fi
+}
 
-  printf 'unknown\n'
+platform_label() {
+  case "$1" in
+    cloudshell)
+      printf 'Cloud Shell\n'
+      ;;
+    generic-linux)
+      if [[ -n "$DETECTED_OS_ID" ]]; then
+        printf 'generic Linux (%s)\n' "$DETECTED_OS_ID"
+      else
+        printf 'generic Linux\n'
+      fi
+      ;;
+    unknown-linux)
+      printf 'unknown Linux\n'
+      ;;
+    *)
+      printf '%s\n' "$1"
+      ;;
+  esac
+}
+
+resolve_service_mode() {
+  case "$SERVICE_MODE" in
+    auto)
+      case "$ACTIVE_PLATFORM" in
+        cloudshell)
+          ACTIVE_SERVICE_MODE="bashrc"
+          ;;
+        generic-linux)
+          ACTIVE_SERVICE_MODE="systemd-user"
+          ;;
+        *)
+          ACTIVE_SERVICE_MODE="none"
+          ;;
+      esac
+      ;;
+    bashrc|systemd-user|none)
+      ACTIVE_SERVICE_MODE="$SERVICE_MODE"
+      ;;
+    "" )
+      die "--service requires a value."
+      ;;
+    *)
+      die "Unsupported service mode: $SERVICE_MODE"
+      ;;
+  esac
+}
+
+validate_platform_service_mode() {
+  case "$ACTIVE_PLATFORM:$ACTIVE_SERVICE_MODE" in
+    cloudshell:bashrc|generic-linux:systemd-user|generic-linux:none)
+      ;;
+    cloudshell:systemd-user|cloudshell:none)
+      die "Service mode '$ACTIVE_SERVICE_MODE' is not supported for Cloud Shell in this phase."
+      ;;
+    generic-linux:bashrc)
+      die "Service mode 'bashrc' is Cloud Shell-specific; use systemd-user or none for generic Linux."
+      ;;
+  esac
+}
+
+require_supported_install_platform() {
+  case "$ACTIVE_PLATFORM" in
+    cloudshell)
+      return 0
+      ;;
+    generic-linux)
+      die "Generic Linux was detected, but install support starts in Phase 4."
+      ;;
+    unknown-linux)
+      die "Unsupported Linux distribution. Phase 4 starts with Ubuntu/Debian only."
+      ;;
+    *)
+      die "Unsupported platform: $ACTIVE_PLATFORM"
+      ;;
+  esac
 }
 
 resolve_platform() {
@@ -212,7 +328,7 @@ resolve_platform() {
       ACTIVE_PLATFORM="cloudshell"
       ;;
     generic-linux)
-      die "Generic Linux support is planned but not implemented in this phase."
+      ACTIVE_PLATFORM="generic-linux"
       ;;
     "" )
       die "--platform requires a value."
@@ -222,26 +338,44 @@ resolve_platform() {
       ;;
   esac
 
-  case "$SERVICE_MODE" in
-    auto|bashrc)
+  resolve_service_mode
+  validate_platform_service_mode
+
+  log "Detected platform: $(platform_label "$ACTIVE_PLATFORM")"
+  log "Service mode: $ACTIVE_SERVICE_MODE"
+}
+
+platform_install_autostart() {
+  case "$ACTIVE_PLATFORM:$ACTIVE_SERVICE_MODE" in
+    cloudshell:bashrc)
+      install_bashrc_hook
       ;;
-    systemd-user|none)
-      die "Service mode '$SERVICE_MODE' is planned but not implemented in this phase."
-      ;;
-    "" )
-      die "--service requires a value."
+    generic-linux:systemd-user|generic-linux:none)
+      die "Generic Linux service setup starts in Phase 4."
       ;;
     *)
-      die "Unsupported service mode: $SERVICE_MODE"
+      die "Unsupported service mode '$ACTIVE_SERVICE_MODE' for platform '$ACTIVE_PLATFORM'."
       ;;
   esac
+}
 
-  if [[ "$ACTIVE_PLATFORM" != "cloudshell" ]]; then
-    log "Detected platform: $ACTIVE_PLATFORM"
-    die "Generic Linux support is planned but not implemented in this phase. Use --platform cloudshell only if this is Cloud Shell and auto-detection failed."
-  fi
-
-  log "Detected platform: Cloud Shell"
+platform_dashboard_hint() {
+  case "$ACTIVE_PLATFORM" in
+    cloudshell)
+      print_setup_block 1 <<'EOF'
+Dashboard:
+  Open Cloud Shell Web Preview on port 8080.
+EOF
+      ;;
+    generic-linux)
+      print_setup_block 1 <<'EOF'
+Dashboard:
+  The dashboard will bind to 127.0.0.1:8080 by default.
+  Use SSH local port forwarding:
+    ssh -L 8080:127.0.0.1:8080 user@server
+EOF
+      ;;
+  esac
 }
 
 # Common helpers
@@ -768,7 +902,7 @@ update_monitor_only() {
 
   [[ -d "$INSTALL_DIR" ]] || die "Install directory does not exist: $INSTALL_DIR"
   update_monitor_program
-  install_bashrc_hook
+  platform_install_autostart
   log "Restarting monitor without stopping Minecraft."
   MC_MONITOR_ROOT="$INSTALL_DIR" "$INSTALL_DIR/cloudshell-mc-monitor" -restart monitor
   log "Monitor update complete."
@@ -776,6 +910,7 @@ update_monitor_only() {
 
 main() {
   resolve_platform
+  require_supported_install_platform
 
   if [[ "$UPDATE_MONITOR" -eq 1 ]]; then
     update_monitor_only
@@ -792,7 +927,7 @@ main() {
   download_playit
   setup_playit_claim
   install_monitor
-  install_bashrc_hook
+  platform_install_autostart
   start_and_verify_monitor
 
   print_setup_block 1 <<EOF
@@ -801,9 +936,6 @@ Setup complete.
 
 Install directory:
   $INSTALL_DIR
-
-Dashboard:
-  Open Cloud Shell Web Preview on port 8080.
 
 Useful commands:
   cd "$INSTALL_DIR"
@@ -816,6 +948,7 @@ Logs:
   tail -f "$INSTALL_DIR/.runtime/minecraft.log"
   tail -f "$INSTALL_DIR/.runtime/playit.log"
 EOF
+  platform_dashboard_hint
 }
 
 main "$@"
