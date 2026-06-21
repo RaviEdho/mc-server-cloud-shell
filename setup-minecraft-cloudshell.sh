@@ -15,18 +15,63 @@ UPDATE_MONITOR=0
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SETUP_DIR=""
 PLAYIT_SETUP_PID=""
+SETUP_COLOR="1;36"
+
+color_enabled() {
+  local fd="$1"
+  [[ -z "${SETUP_NO_COLOR:-}" && -t $fd ]]
+}
+
+print_plain() {
+  local fd="$1"
+  local text="$2"
+  if [[ "$fd" -eq 2 ]]; then
+    printf '%s' "$text" >&2
+  else
+    printf '%s' "$text"
+  fi
+}
+
+print_setup_text() {
+  local fd="$1"
+  local text="$2"
+  local ending="${3:-$'\n'}"
+
+  if [[ -z "$text" ]]; then
+    print_plain "$fd" "$ending"
+    return 0
+  fi
+
+  if color_enabled "$fd"; then
+    if [[ "$fd" -eq 2 ]]; then
+      printf '\033[%sm%s\033[0m%s' "$SETUP_COLOR" "$text" "$ending" >&2
+    else
+      printf '\033[%sm%s\033[0m%s' "$SETUP_COLOR" "$text" "$ending"
+    fi
+  else
+    print_plain "$fd" "${text}${ending}"
+  fi
+}
+
+print_setup_block() {
+  local fd="$1"
+  local line
+  while IFS= read -r line; do
+    print_setup_text "$fd" "$line"
+  done
+}
 
 log() {
-  printf '[setup] %s\n' "$*"
+  print_setup_text 1 "[setup] $*"
 }
 
 die() {
-  printf '[setup] ERROR: %s\n' "$*" >&2
+  print_setup_text 2 "[setup] ERROR: $*"
   exit 1
 }
 
 usage() {
-  cat <<'USAGE'
+  print_setup_block 1 <<'USAGE'
 Usage:
   ./setup-minecraft-cloudshell.sh [options]
 
@@ -362,7 +407,7 @@ PROPS
     if [[ ! -t 0 ]]; then
       die "EULA agreement required. Rerun with --agree-eula if you agree to https://aka.ms/MinecraftEULA."
     fi
-    printf 'Do you agree to the Minecraft EULA (https://aka.ms/MinecraftEULA)? Type "yes" to continue: '
+    print_setup_text 1 'Do you agree to the Minecraft EULA (https://aka.ms/MinecraftEULA)? Type "yes" to continue: ' ''
     read -r reply
     [[ "$reply" == "yes" ]] || die "EULA was not accepted."
   fi
@@ -622,7 +667,7 @@ main() {
   install_bashrc_hook
   start_and_verify_monitor
 
-  cat <<EOF
+  print_setup_block 1 <<EOF
 
 Setup complete.
 
