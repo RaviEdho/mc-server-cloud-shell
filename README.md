@@ -9,7 +9,15 @@ It is designed around two source files:
 
 ## Quick Start
 
-Put both files in the same directory, then run:
+Run the installer directly from GitHub:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/RaviEdho/mc-server-cloud-shell/master/setup-minecraft-cloudshell.sh | bash
+```
+
+The setup script downloads the monitor source when needed, reads interactive prompts from the terminal, and cleans up temporary installer files automatically.
+
+If you already cloned the repository, run:
 
 ```bash
 chmod +x setup-minecraft-cloudshell.sh

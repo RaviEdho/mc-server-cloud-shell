@@ -12,10 +12,19 @@ SKIP_PLAYIT_CLAIM=0
 START_MONITOR=1
 UPDATE_MONITOR=0
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
+if [[ -n "$SCRIPT_SOURCE" && -f "$SCRIPT_SOURCE" ]]; then
+  SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_SOURCE")" && pwd)"
+else
+  SCRIPT_DIR="$(pwd)"
+fi
 SETUP_DIR=""
 PLAYIT_SETUP_PID=""
 SETUP_COLOR="1;36"
+RAW_REPO_BASE="${RAW_REPO_BASE:-https://raw.githubusercontent.com/RaviEdho/mc-server-cloud-shell/master}"
+TEMP_FILES=()
+DOWNLOADED_TEMP_FILE=""
+MONITOR_SOURCE=""
 
 color_enabled() {
   local fd="$1"
@@ -59,6 +68,10 @@ print_setup_block() {
   while IFS= read -r line; do
     print_setup_text "$fd" "$line"
   done
+}
+
+require_tty() {
+  [[ -r /dev/tty && -w /dev/tty ]] || die "$1"
 }
 
 log() {
@@ -151,6 +164,9 @@ cleanup() {
   if [[ -n "${PLAYIT_SETUP_PID:-}" ]] && kill -0 "$PLAYIT_SETUP_PID" 2>/dev/null; then
     kill "$PLAYIT_SETUP_PID" 2>/dev/null || true
   fi
+  if [[ "${#TEMP_FILES[@]}" -gt 0 ]]; then
+    rm -f "${TEMP_FILES[@]}" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 
@@ -163,6 +179,15 @@ download() {
   local output="$2"
   log "Downloading $url"
   curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 -o "$output" "$url"
+}
+
+download_temp_file() {
+  local url="$1"
+  local tmp
+  tmp="$(mktemp)"
+  TEMP_FILES+=("$tmp")
+  download "$url" "$tmp" >&2
+  DOWNLOADED_TEMP_FILE="$tmp"
 }
 
 check_prerequisites() {
@@ -404,11 +429,9 @@ PROPS
   fi
 
   if [[ "$AGREE_EULA" -ne 1 ]]; then
-    if [[ ! -t 0 ]]; then
-      die "EULA agreement required. Rerun with --agree-eula if you agree to https://aka.ms/MinecraftEULA."
-    fi
+    require_tty "EULA agreement requires an interactive terminal. Rerun with --agree-eula if you agree to https://aka.ms/MinecraftEULA."
     print_setup_text 1 'Do you agree to the Minecraft EULA (https://aka.ms/MinecraftEULA)? Type "yes" to continue: ' ''
-    read -r reply
+    read -r reply < /dev/tty
     [[ "$reply" == "yes" ]] || die "EULA was not accepted."
   fi
 
@@ -481,12 +504,10 @@ setup_playit_claim() {
   start_playit_setup_daemon "$socket" "$secret"
 
   if [[ ! -s "$secret" ]]; then
-    if [[ ! -t 0 ]]; then
-      die "playit first-time setup requires an interactive terminal. Rerun without --skip-playit-claim in a terminal."
-    fi
+    require_tty "playit first-time setup requires an interactive terminal. Rerun with --skip-playit-claim to skip it."
     log "Running playit setup. Open the claim link it prints; setup will continue after the claim completes."
     set +e
-    "$INSTALL_DIR/playit-cli-linux-amd64" --socket-path "$socket" setup
+    "$INSTALL_DIR/playit-cli-linux-amd64" --socket-path "$socket" setup < /dev/tty
     local cli_code=$?
     set -e
     if [[ "$cli_code" -ne 0 ]]; then
@@ -508,14 +529,27 @@ install_monitor() {
   MC_MONITOR_ROOT="$INSTALL_DIR" "$INSTALL_DIR/cloudshell-mc-monitor" -configure
 }
 
+resolve_monitor_source() {
+  local local_source="$SCRIPT_DIR/cloudshell-mc-monitor.go"
+  if [[ -f "$local_source" ]]; then
+    MONITOR_SOURCE="$local_source"
+    return 0
+  fi
+
+  download_temp_file "$RAW_REPO_BASE/cloudshell-mc-monitor.go"
+  MONITOR_SOURCE="$DOWNLOADED_TEMP_FILE"
+}
+
 update_monitor_program() {
-  local go_source="$SCRIPT_DIR/cloudshell-mc-monitor.go"
+  local go_source
   local installed_source="$INSTALL_DIR/cloudshell-mc-monitor.go"
   local installed_binary="$INSTALL_DIR/cloudshell-mc-monitor"
   local source_updated=0
   local rebuilt=0
 
-  [[ -f "$go_source" ]] || die "Missing monitor source next to setup script: $go_source"
+  resolve_monitor_source || die "Unable to resolve monitor source."
+  go_source="$MONITOR_SOURCE"
+  [[ -f "$go_source" ]] || die "Missing monitor source: $go_source"
 
   mkdir -p "$INSTALL_DIR" "$INSTALL_DIR/.gocache"
 
@@ -634,9 +668,11 @@ start_and_verify_monitor() {
 
 update_monitor_only() {
   require_command bash
+  require_command curl
   require_command cp
   require_command chmod
   require_command go
+  require_command mktemp
   require_command mkdir
   require_command rm
 
