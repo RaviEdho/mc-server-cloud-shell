@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bufio"
 	"bytes"
 	"context"
@@ -128,16 +129,26 @@ type statusResponse struct {
 }
 
 type minecraftStatus struct {
-	UpdatedAt     string   `json:"updatedAt,omitempty"`
-	PortOpen      bool     `json:"portOpen"`
-	RCONOK        bool     `json:"rconOk"`
-	Version       string   `json:"version"`
-	PlayersOnline int      `json:"playersOnline"`
-	MaxPlayers    int      `json:"maxPlayers"`
-	Players       []string `json:"players"`
-	TPS           string   `json:"tps"`
-	MSPT          string   `json:"mspt"`
-	LastError     string   `json:"lastError,omitempty"`
+	UpdatedAt     string    `json:"updatedAt,omitempty"`
+	PortOpen      bool      `json:"portOpen"`
+	RCONOK        bool      `json:"rconOk"`
+	Version       string    `json:"version"`
+	World         worldInfo `json:"world"`
+	PlayersOnline int       `json:"playersOnline"`
+	MaxPlayers    int       `json:"maxPlayers"`
+	Players       []string  `json:"players"`
+	TPS           string    `json:"tps"`
+	MSPT          string    `json:"mspt"`
+	LastError     string    `json:"lastError,omitempty"`
+}
+
+type worldInfo struct {
+	Name       string `json:"name"`
+	GameMode   string `json:"gameMode"`
+	Difficulty string `json:"difficulty"`
+	Hardcore   bool   `json:"hardcore"`
+	SizeBytes  int64  `json:"sizeBytes"`
+	Size       string `json:"size"`
 }
 
 type playitStatus struct {
@@ -821,6 +832,8 @@ func (a *app) routes() http.Handler {
 	mux.HandleFunc("/api/metrics", a.handleMetrics)
 	mux.HandleFunc("/api/logs", a.handleLogs)
 	mux.HandleFunc("/api/command", a.handleCommand)
+	mux.HandleFunc("/api/world/download", a.handleWorldDownload)
+	mux.HandleFunc("/api/world/upload", a.handleWorldUpload)
 	mux.HandleFunc("/api/minecraft/", a.handleAction("minecraft"))
 	mux.HandleFunc("/api/playit/", a.handleAction("playit"))
 	return mux
@@ -905,6 +918,97 @@ func (a *app) handleCommand(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"command": command, "output": out})
 }
 
+func (a *app) handleWorldDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	worldPath, world, err := a.worldPath()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	info, err := os.Stat(worldPath)
+	if err != nil || !info.IsDir() {
+		http.Error(w, "world folder not found", http.StatusNotFound)
+		return
+	}
+	filename := safeZipName(world.Name)
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+	w.Header().Set("Cache-Control", "no-store")
+	if err := zipWorld(worldPath, world.Name, w); err != nil {
+		a.log("world download failed: %v", err)
+	}
+}
+
+func (a *app) handleWorldUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if a.minecraft.snapshot().Running {
+		http.Error(w, "stop Minecraft before uploading a world zip", http.StatusConflict)
+		return
+	}
+	worldPath, world, err := a.worldPath()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 2<<30)
+	if err := r.ParseMultipartForm(64 << 20); err != nil {
+		http.Error(w, "invalid zip upload", http.StatusBadRequest)
+		return
+	}
+	file, header, err := r.FormFile("world")
+	if err != nil {
+		http.Error(w, "world zip file is required", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+	if !strings.EqualFold(filepath.Ext(header.Filename), ".zip") {
+		http.Error(w, "only .zip files are accepted", http.StatusBadRequest)
+		return
+	}
+
+	tmpDir, err := os.MkdirTemp(a.cfg.runtimeDir, "world-upload-*")
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	defer os.RemoveAll(tmpDir)
+
+	zipPath := filepath.Join(tmpDir, "upload.zip")
+	tmpZip, err := os.Create(zipPath)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if _, err := io.Copy(tmpZip, file); err != nil {
+		_ = tmpZip.Close()
+		writeError(w, err)
+		return
+	}
+	if err := tmpZip.Close(); err != nil {
+		writeError(w, err)
+		return
+	}
+
+	extractDir := filepath.Join(tmpDir, "extract")
+	sourceDir, err := extractWorldZip(zipPath, extractDir)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := replaceWorldDir(sourceDir, worldPath); err != nil {
+		writeError(w, err)
+		return
+	}
+	a.log("world uploaded: %s -> %s", header.Filename, world.Name)
+	writeJSON(w, map[string]string{"ok": "true", "world": world.Name})
+}
+
 func dashboardRCONCommand(command string) string {
 	name, message, ok := strings.Cut(command, " ")
 	if !ok || !strings.EqualFold(name, "say") {
@@ -961,6 +1065,246 @@ func (a *app) handleAction(target string) http.HandlerFunc {
 	}
 }
 
+func (a *app) worldPath() (string, worldInfo, error) {
+	propsPath := filepath.Join(a.cfg.serverDir, "server.properties")
+	world := readWorldInfo(propsPath)
+	if world.Name == "" {
+		world.Name = "world"
+	}
+	if filepath.IsAbs(world.Name) {
+		return "", world, fmt.Errorf("world name must be relative")
+	}
+	cleanName := filepath.Clean(world.Name)
+	if cleanName == "." || cleanName == ".." || strings.HasPrefix(cleanName, ".."+string(filepath.Separator)) {
+		return "", world, fmt.Errorf("world name escapes server directory")
+	}
+	path := filepath.Join(a.cfg.serverDir, cleanName)
+	serverDir, err := filepath.Abs(a.cfg.serverDir)
+	if err != nil {
+		return "", world, err
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", world, err
+	}
+	rel, err := filepath.Rel(serverDir, absPath)
+	if err != nil {
+		return "", world, err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", world, fmt.Errorf("world path escapes server directory")
+	}
+	return absPath, world, nil
+}
+
+func safeZipName(worldName string) string {
+	name := filepath.Base(filepath.Clean(worldName))
+	name = strings.TrimSpace(name)
+	if name == "." || name == "" {
+		name = "world"
+	}
+	return name + ".zip"
+}
+
+func zipWorld(worldPath, worldName string, w io.Writer) error {
+	zw := zip.NewWriter(w)
+	defer zw.Close()
+	rootName := filepath.Base(filepath.Clean(worldName))
+	if rootName == "." || rootName == "" {
+		rootName = "world"
+	}
+	return filepath.WalkDir(worldPath, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+		rel, err := filepath.Rel(worldPath, path)
+		if err != nil {
+			return err
+		}
+		zipName := rootName
+		if rel != "." {
+			zipName = filepath.ToSlash(filepath.Join(rootName, rel))
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		header, err := zip.FileInfoHeader(info)
+		if err != nil {
+			return err
+		}
+		header.Name = zipName
+		if d.IsDir() {
+			header.Name += "/"
+			_, err = zw.CreateHeader(header)
+			return err
+		}
+		header.Method = zip.Deflate
+		writer, err := zw.CreateHeader(header)
+		if err != nil {
+			return err
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		_, copyErr := io.Copy(writer, file)
+		closeErr := file.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		return closeErr
+	})
+}
+
+func extractWorldZip(zipPath, dest string) (string, error) {
+	reader, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return "", fmt.Errorf("invalid zip file")
+	}
+	defer reader.Close()
+	if len(reader.File) == 0 {
+		return "", fmt.Errorf("zip file is empty")
+	}
+	if err := os.MkdirAll(dest, 0755); err != nil {
+		return "", err
+	}
+	for _, file := range reader.File {
+		cleanName, err := cleanZipPath(file.Name)
+		if err != nil {
+			return "", err
+		}
+		if file.FileInfo().Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("zip file contains unsupported symlink: %s", file.Name)
+		}
+		target := filepath.Join(dest, cleanName)
+		if !pathInside(dest, target) {
+			return "", fmt.Errorf("zip file contains unsafe path: %s", file.Name)
+		}
+		if file.FileInfo().IsDir() {
+			if err := os.MkdirAll(target, file.FileInfo().Mode()); err != nil {
+				return "", err
+			}
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+			return "", err
+		}
+		src, err := file.Open()
+		if err != nil {
+			return "", err
+		}
+		dst, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, file.FileInfo().Mode())
+		if err != nil {
+			_ = src.Close()
+			return "", err
+		}
+		_, copyErr := io.Copy(dst, src)
+		closeErr := dst.Close()
+		_ = src.Close()
+		if copyErr != nil {
+			return "", copyErr
+		}
+		if closeErr != nil {
+			return "", closeErr
+		}
+	}
+	source, err := uploadedWorldRoot(dest)
+	if err != nil {
+		return "", err
+	}
+	if !fileExists(filepath.Join(source, "level.dat")) {
+		return "", fmt.Errorf("zip does not contain a Minecraft world level.dat")
+	}
+	return source, nil
+}
+
+func cleanZipPath(name string) (string, error) {
+	name = strings.ReplaceAll(name, "\\", "/")
+	clean := filepath.Clean(name)
+	if clean == "." || clean == ".." || filepath.IsAbs(clean) || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("zip file contains unsafe path: %s", name)
+	}
+	return clean, nil
+}
+
+func uploadedWorldRoot(extractDir string) (string, error) {
+	if fileExists(filepath.Join(extractDir, "level.dat")) {
+		return extractDir, nil
+	}
+	entries, err := os.ReadDir(extractDir)
+	if err != nil {
+		return "", err
+	}
+	var dirs []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if name == "__MACOSX" || name == ".DS_Store" {
+			continue
+		}
+		if entry.IsDir() {
+			dirs = append(dirs, filepath.Join(extractDir, name))
+			continue
+		}
+		return "", fmt.Errorf("zip must contain a single world folder or world files directly")
+	}
+	if len(dirs) != 1 {
+		return "", fmt.Errorf("zip must contain a single world folder or world files directly")
+	}
+	return dirs[0], nil
+}
+
+func replaceWorldDir(source, target string) error {
+	if !pathInside(filepath.Dir(target), target) {
+		return fmt.Errorf("unsafe world target")
+	}
+	backup := target + ".backup-" + time.Now().Format("20060102-150405")
+	hadExisting := false
+	if _, err := os.Stat(target); err == nil {
+		hadExisting = true
+		if err := os.Rename(target, backup); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+		if hadExisting {
+			_ = os.Rename(backup, target)
+		}
+		return err
+	}
+	if err := os.Rename(source, target); err != nil {
+		if hadExisting {
+			_ = os.Rename(backup, target)
+		}
+		return err
+	}
+	if hadExisting {
+		_ = os.RemoveAll(backup)
+	}
+	return nil
+}
+
+func pathInside(root, path string) bool {
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+	pathAbs, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(rootAbs, pathAbs)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
 func (a *app) status() statusResponse {
 	machine := a.collectMachineMetric()
 	mc := a.cachedMinecraftHealth()
@@ -987,6 +1331,7 @@ func (a *app) status() statusResponse {
 func (a *app) cachedMinecraftHealth() minecraftStatus {
 	a.healthMu.RLock()
 	defer a.healthMu.RUnlock()
+	propsPath := filepath.Join(a.cfg.serverDir, "server.properties")
 	if a.minecraftCache.UpdatedAt != "" {
 		return a.minecraftCache
 	}
@@ -994,7 +1339,8 @@ func (a *app) cachedMinecraftHealth() minecraftStatus {
 		UpdatedAt:  time.Now().Format(time.RFC3339),
 		PortOpen:   dialOK("127.0.0.1:25565", 700*time.Millisecond),
 		Version:    parseServerVersion(filepath.Join(a.cfg.runtimeDir, "minecraft.log"), filepath.Join(a.cfg.serverDir, "logs", "latest.log")),
-		MaxPlayers: readMaxPlayers(filepath.Join(a.cfg.serverDir, "server.properties")),
+		World:      readWorldInfo(propsPath),
+		MaxPlayers: readMaxPlayers(propsPath),
 		Players:    []string{},
 		LastError:  "waiting for first health sample",
 	}
@@ -1012,21 +1358,23 @@ func (a *app) refreshMinecraftHealth() {
 }
 
 func (a *app) minecraftHealth() minecraftStatus {
+	propsPath := filepath.Join(a.cfg.serverDir, "server.properties")
 	result := minecraftStatus{
 		PortOpen: dialOK("127.0.0.1:25565", 700*time.Millisecond),
 		Version:  parseServerVersion(filepath.Join(a.cfg.runtimeDir, "minecraft.log"), filepath.Join(a.cfg.serverDir, "logs", "latest.log")),
+		World:    readWorldInfo(propsPath),
 		Players:  []string{},
 	}
 	out, err := a.rconCommands("list", "tick query")
 	if err != nil {
 		result.LastError = err.Error()
-		result.MaxPlayers = readMaxPlayers(filepath.Join(a.cfg.serverDir, "server.properties"))
+		result.MaxPlayers = readMaxPlayers(propsPath)
 		return result
 	}
 	result.RCONOK = true
 	result.PlayersOnline, result.MaxPlayers, result.Players = parseListOutput(out[0])
 	if result.MaxPlayers == 0 {
-		result.MaxPlayers = readMaxPlayers(filepath.Join(a.cfg.serverDir, "server.properties"))
+		result.MaxPlayers = readMaxPlayers(propsPath)
 	}
 	if len(out) > 1 {
 		result.TPS, result.MSPT = parseTickOutput(out[1])
@@ -1444,6 +1792,45 @@ func diskUsage(path string) (used, total uint64) {
 	return used, total
 }
 
+func dirSize(path string) int64 {
+	var total int64
+	_ = filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		total += info.Size()
+		return nil
+	})
+	return total
+}
+
+func formatBytes(size int64) string {
+	if size <= 0 {
+		return "0 B"
+	}
+	units := []string{"B", "KB", "MB", "GB", "TB"}
+	value := float64(size)
+	unit := 0
+	for value >= 1024 && unit < len(units)-1 {
+		value /= 1024
+		unit++
+	}
+	if unit == 0 {
+		return fmt.Sprintf("%d %s", size, units[unit])
+	}
+	return fmt.Sprintf("%.1f %s", value, units[unit])
+}
+
 func parseListOutput(out string) (int, int, []string) {
 	re := regexp.MustCompile(`There are (\d+) of a max of (\d+) players online:?\s*(.*)`)
 	matches := re.FindStringSubmatch(out)
@@ -1493,24 +1880,67 @@ func parseServerVersion(paths ...string) string {
 func parsePlayitAddress(path string) string {
 	data, err := os.ReadFile(path)
 	if err != nil {
+		return readCachedPlayitAddress(filepath.Join(filepath.Dir(path), "playit.address"))
+	}
+	content := string(data)
+	if host := preferredPlayitHost(findPlayitHosts(content)); host != "" {
+		cachePlayitAddress(filepath.Join(filepath.Dir(path), "playit.address"), host)
+		return host
+	}
+
+	var decodedHosts []string
+	tokenRe := regexp.MustCompile(`token:\s*([0-9a-fA-F]+)`)
+	for _, match := range tokenRe.FindAllStringSubmatch(content, -1) {
+		decoded, err := hex.DecodeString(match[1])
+		if err != nil {
+			continue
+		}
+		decodedHosts = append(decodedHosts, findPlayitHosts(string(decoded))...)
+	}
+	if host := preferredPlayitHost(decodedHosts); host != "" {
+		cachePlayitAddress(filepath.Join(filepath.Dir(path), "playit.address"), host)
+		return host
+	}
+	return readCachedPlayitAddress(filepath.Join(filepath.Dir(path), "playit.address"))
+}
+
+func findPlayitHosts(content string) []string {
+	re := regexp.MustCompile(`(?i)[a-z0-9][a-z0-9.-]*\.(?:joinmc\.link|playit\.gg)(?::\d+)?`)
+	return re.FindAllString(content, -1)
+}
+
+func preferredPlayitHost(hosts []string) string {
+	var fallback string
+	var joinMC string
+	for _, host := range hosts {
+		host = strings.Trim(host, ".")
+		if host == "" {
+			continue
+		}
+		fallback = host
+		if strings.Contains(strings.ToLower(host), ".joinmc.link") {
+			joinMC = host
+		}
+	}
+	if joinMC != "" {
+		return joinMC
+	}
+	return fallback
+}
+
+func cachePlayitAddress(path, address string) {
+	if address == "" {
+		return
+	}
+	_ = os.WriteFile(path, []byte(address+"\n"), 0644)
+}
+
+func readCachedPlayitAddress(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
 		return ""
 	}
-	re := regexp.MustCompile(`[a-zA-Z0-9.-]+\.playit\.gg(?::\d+)?`)
-	matches := re.FindAllString(string(data), -1)
-	if len(matches) > 0 {
-		return matches[len(matches)-1]
-	}
-	re = regexp.MustCompile(`connect_addr:\s*([0-9.]+:\d+)`)
-	submatches := re.FindAllStringSubmatch(string(data), -1)
-	if len(submatches) > 0 {
-		return submatches[len(submatches)-1][1]
-	}
-	re = regexp.MustCompile(`address:\s*([0-9.]+:\d+)`)
-	submatches = re.FindAllStringSubmatch(string(data), -1)
-	if len(submatches) > 0 {
-		return submatches[len(submatches)-1][1]
-	}
-	return ""
+	return preferredPlayitHost(findPlayitHosts(strings.TrimSpace(string(data))))
 }
 
 func readMaxPlayers(path string) int {
@@ -1521,6 +1951,36 @@ func readMaxPlayers(path string) int {
 	props := parseProperties(string(data))
 	v, _ := strconv.Atoi(props["max-players"])
 	return v
+}
+
+func readWorldInfo(path string) worldInfo {
+	serverDir := filepath.Dir(path)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		info := worldInfo{Name: "world"}
+		info.SizeBytes = dirSize(filepath.Join(serverDir, info.Name))
+		info.Size = formatBytes(info.SizeBytes)
+		return info
+	}
+	props := parseProperties(string(data))
+	name := defaultString(props["level-name"], "world")
+	sizeBytes := dirSize(filepath.Join(serverDir, name))
+	return worldInfo{
+		Name:       name,
+		GameMode:   defaultString(props["gamemode"], "survival"),
+		Difficulty: defaultString(props["difficulty"], "easy"),
+		Hardcore:   strings.EqualFold(props["hardcore"], "true"),
+		SizeBytes:  sizeBytes,
+		Size:       formatBytes(sizeBytes),
+	}
+}
+
+func defaultString(value, fallback string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fallback
+	}
+	return value
 }
 
 func tailLines(path string, limit int, search string) ([]string, error) {
@@ -1883,21 +2343,25 @@ var dashboardTemplate = template.Must(template.New("dashboard").Parse(`<!doctype
 <style>
 :root {
   color-scheme: dark;
-  --bg: #101214;
-  --panel: #181b1f;
-  --panel2: #20242a;
+  --bg: #0e1116;
+  --panel: #171b22;
+  --panel2: #202633;
   --text: #e8ecef;
-  --muted: #9ba7b3;
-  --line: #333941;
-  --good: #31c48d;
-  --warn: #f6ad55;
-  --bad: #f56565;
-  --accent: #63b3ed;
+  --muted: #9aa6b2;
+  --line: #2b3340;
+  --good: #36d399;
+  --warn: #fbbf24;
+  --bad: #fb7185;
+  --accent: #38bdf8;
+  --accent2: #a78bfa;
+  --shadow: 0 18px 50px rgba(0,0,0,0.22);
 }
 * { box-sizing: border-box; }
 body {
   margin: 0;
-  background: var(--bg);
+  background:
+    linear-gradient(180deg, rgba(56,189,248,0.08), transparent 280px),
+    var(--bg);
   color: var(--text);
   font: 14px/1.4 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
@@ -1906,29 +2370,79 @@ header {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 18px 22px;
+  padding: 18px 32px;
+  background: rgba(14,17,22,0.82);
+  backdrop-filter: blur(14px);
   border-bottom: 1px solid var(--line);
+  position: sticky;
+  top: 0;
+  z-index: 10;
 }
 h1 { margin: 0; font-size: 20px; font-weight: 650; }
-main { padding: 18px 22px 28px; max-width: 1440px; margin: 0 auto; }
+main { padding: 20px 32px 30px; max-width: 1120px; margin: 0 auto; }
 .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
 .wide { grid-column: span 2; }
 .full { grid-column: 1 / -1; }
+.status-layout {
+  display: grid;
+  grid-template-columns: minmax(280px, 0.9fr) minmax(0, 1.25fr);
+  gap: 12px;
+  align-items: stretch;
+  margin-bottom: 12px;
+}
+.service-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.service-grid .panel,
+.machine-panel { min-height: 0; }
+.info-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 12px;
+}
 .panel {
-  background: var(--panel);
+  background: rgba(23,27,34,0.94);
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 14px;
+  box-shadow: var(--shadow);
 }
-.panel h2 { margin: 0 0 12px; font-size: 14px; color: var(--muted); font-weight: 600; }
+.panel h2 { margin: 0 0 12px; font-size: 13px; color: var(--muted); font-weight: 650; text-transform: uppercase; letter-spacing: 0; }
 .metric { font-size: 26px; font-weight: 700; }
+.metric.wrap { overflow-wrap: anywhere; line-height: 1.15; }
 .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .row + .row { margin-top: 8px; }
-.pill { padding: 3px 8px; border-radius: 999px; background: var(--panel2); color: var(--muted); font-size: 12px; }
+.pill { padding: 3px 8px; border-radius: 999px; background: var(--panel2); color: var(--muted); font-size: 12px; border: 1px solid rgba(255,255,255,0.04); }
 .ok { color: var(--good); }
 .bad { color: var(--bad); }
 .warn { color: var(--warn); }
+.usage-list { display: grid; gap: 16px; }
+.usage-head { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
+.usage-label { color: var(--muted); font-weight: 600; }
+.usage-value { font-size: 18px; font-weight: 700; }
+.usage-detail { color: var(--muted); font-size: 12px; margin-top: 4px; }
+.bar {
+  height: 8px;
+  margin-top: 8px;
+  overflow: hidden;
+  background: #0b0d0f;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+.bar > span {
+  display: block;
+  height: 100%;
+  width: 0;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 180ms ease;
+}
+.bar.mem > span { background: var(--good); }
+.bar.disk > span { background: var(--warn); }
 button, select, input {
   background: var(--panel2);
   color: var(--text);
@@ -1936,9 +2450,49 @@ button, select, input {
   border-radius: 6px;
   padding: 8px 10px;
 }
-button { cursor: pointer; }
-button:hover { border-color: var(--accent); }
+button { cursor: pointer; transition: border-color 150ms ease, transform 150ms ease, background 150ms ease; }
+button:disabled { cursor: not-allowed; opacity: 0.55; }
+button:hover { border-color: var(--accent); transform: translateY(-1px); }
 button.danger:hover { border-color: var(--bad); }
+.hidden-file { display: none; }
+.panel-title-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+.panel-title-row h2 { margin: 0; }
+.segmented {
+  display: inline-flex;
+  gap: 2px;
+  padding: 3px;
+  background: #0b0f16;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.segmented button {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  padding: 5px 9px;
+}
+.segmented button:hover,
+.segmented button.active {
+  color: var(--text);
+  background: var(--panel2);
+  transform: none;
+}
+.chart-panel { padding-bottom: 10px; }
+.chart-meta {
+  min-height: 18px;
+  margin: -4px 0 8px;
+}
+.chart-wrap {
+  height: 260px;
+  min-height: 260px;
+  position: relative;
+}
 .terminal {
   display: flex;
   gap: 8px;
@@ -1980,15 +2534,20 @@ pre {
   white-space: pre-wrap;
   word-break: break-word;
 }
-canvas { width: 100%; height: 160px; display: block; }
+canvas { width: 100%; display: block; }
 @media (max-width: 900px) {
   .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .wide { grid-column: 1 / -1; }
+  .status-layout { grid-template-columns: 1fr; }
 }
 @media (max-width: 560px) {
   header { align-items: flex-start; flex-direction: column; }
   main { padding: 14px; }
   .grid { grid-template-columns: 1fr; }
+  .service-grid,
+  .info-grid { grid-template-columns: 1fr; }
+  .panel-title-row { align-items: flex-start; flex-direction: column; }
+  .chart-wrap { height: 240px; min-height: 240px; }
 }
 </style>
 </head>
@@ -2003,39 +2562,83 @@ canvas { width: 100%; height: 160px; display: block; }
   </div>
 </header>
 <main>
-  <section class="grid">
-    <div class="panel"><h2>CPU</h2><div class="metric" id="cpu">-</div><div class="sub">Cloud Shell VM</div></div>
-    <div class="panel"><h2>Memory</h2><div class="metric" id="mem">-</div><div class="sub" id="memSub">-</div></div>
-    <div class="panel"><h2>Disk</h2><div class="metric" id="disk">-</div><div class="sub" id="diskSub">-</div></div>
+  <section class="status-layout">
+    <div class="panel machine-panel">
+      <h2>Machine Status</h2>
+      <div class="usage-list">
+        <div>
+          <div class="usage-head"><span class="usage-label">CPU</span><span class="usage-value" id="cpu">-</span></div>
+          <div class="usage-detail">Cloud Shell VM</div>
+          <div class="bar cpu"><span id="cpuBar"></span></div>
+        </div>
+        <div>
+          <div class="usage-head"><span class="usage-label">Memory</span><span class="usage-value" id="mem">-</span></div>
+          <div class="usage-detail" id="memSub">-</div>
+          <div class="bar mem"><span id="memBar"></span></div>
+        </div>
+        <div>
+          <div class="usage-head"><span class="usage-label">Disk</span><span class="usage-value" id="disk">-</span></div>
+          <div class="usage-detail" id="diskSub">-</div>
+          <div class="bar disk"><span id="diskBar"></span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="service-grid">
+      <div class="panel">
+        <h2>Minecraft</h2>
+        <div class="row" id="mcHealth"></div>
+        <div class="row">
+          <button id="minecraftPower" onclick="powerAct('minecraft')">Start</button>
+          <button onclick="act('minecraft','restart')">Restart</button>
+          <button class="danger" onclick="act('minecraft','kill')">Kill</button>
+        </div>
+        <div class="sub" id="mcDetails"></div>
+      </div>
+
+      <div class="panel">
+        <h2>playit</h2>
+        <div class="row" id="playitHealth"></div>
+        <div class="row">
+          <button id="playitPower" onclick="powerAct('playit')">Start</button>
+          <button onclick="act('playit','restart')">Restart</button>
+          <button class="danger" onclick="act('playit','kill')">Kill</button>
+        </div>
+        <div class="sub" id="playitAddress"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="info-grid">
     <div class="panel"><h2>Players</h2><div class="metric" id="players">-</div><div class="sub" id="playerNames">-</div></div>
-
-    <div class="panel wide">
-      <h2>Minecraft</h2>
-      <div class="row" id="mcHealth"></div>
+    <div class="panel">
+      <h2>Minecraft World</h2>
+      <div class="metric wrap" id="worldName">-</div>
+      <div class="sub" id="worldDetails">-</div>
       <div class="row">
-        <button onclick="act('minecraft','start')">Start</button>
-        <button onclick="act('minecraft','stop')">Stop</button>
-        <button onclick="act('minecraft','restart')">Restart</button>
-        <button class="danger" onclick="act('minecraft','kill')">Kill</button>
+        <button onclick="downloadWorld()">Download ZIP</button>
+        <button id="worldUploadButton" onclick="$('worldUpload').click()">Upload ZIP</button>
+        <input class="hidden-file" id="worldUpload" type="file" accept=".zip,application/zip" onchange="uploadWorld()">
       </div>
-      <div class="sub" id="mcDetails"></div>
+      <div class="sub" id="worldTransfer"></div>
     </div>
+  </section>
 
-    <div class="panel wide">
-      <h2>playit</h2>
-      <div class="row" id="playitHealth"></div>
-      <div class="row">
-        <button onclick="act('playit','start')">Start</button>
-        <button onclick="act('playit','stop')">Stop</button>
-        <button onclick="act('playit','restart')">Restart</button>
-        <button class="danger" onclick="act('playit','kill')">Kill</button>
+  <section class="grid">
+    <div class="panel full chart-panel">
+      <div class="panel-title-row">
+        <h2>Machine History</h2>
+        <div class="segmented" id="chartRanges">
+          <button type="button" data-hours="1">1h</button>
+          <button type="button" data-hours="6">6h</button>
+          <button type="button" data-hours="24">24h</button>
+          <button type="button" data-hours="168" class="active">7d</button>
+        </div>
       </div>
-      <div class="sub" id="playitAddress"></div>
-    </div>
-
-    <div class="panel full">
-      <h2>Machine History - Last 7 Days</h2>
-      <canvas id="chart" width="1200" height="220"></canvas>
+      <div class="sub chart-meta" id="chartAvailability">Calculating availability...</div>
+      <div class="chart-wrap">
+        <canvas id="chart"></canvas>
+      </div>
     </div>
 
     <div class="panel full">
@@ -2060,6 +2663,7 @@ canvas { width: 100%; height: 160px; display: block; }
     </div>
   </section>
 </main>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 <script>
 const $ = id => document.getElementById(id);
 const maxLogLines = 200;
@@ -2071,6 +2675,15 @@ let logRestartTimer = null;
 const commandStorageKey = 'mc-command-history';
 let commandHistory = loadCommandHistory();
 let commandHistoryIndex = commandHistory.length;
+let metricChart = null;
+let metricPoints = [];
+let visibleMetricPoints = [];
+let visibleDowntime = [];
+let chartRangeHours = 168;
+const metricSampleMs = 30 * 1000;
+const downtimeGapMs = 90 * 1000;
+const browserTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+const browserTimeZoneLabel = browserTimeZone || 'browser local time';
 
 async function json(url, opts) {
   const res = await fetch(url, opts);
@@ -2083,18 +2696,43 @@ function pill(text, good) {
   return '<span class="pill ' + cls + '">' + text + '</span>';
 }
 
+function setUsage(valueId, barId, percent) {
+  const safe = Math.max(0, Math.min(100, Number(percent) || 0));
+  $(valueId).textContent = safe.toFixed(1) + '%';
+  $(barId).style.width = safe + '%';
+}
+
+function setPowerButton(target, running) {
+  const button = $(target + 'Power');
+  button.dataset.action = running ? 'stop' : 'start';
+  button.textContent = running ? 'Stop' : 'Start';
+  button.classList.toggle('danger', running);
+}
+
 async function refreshAll() {
   try {
     const s = await json('/api/status');
     $('updated').textContent = 'Updated ' + new Date(s.generatedAt).toLocaleString();
-    $('cpu').textContent = s.machine.cpuPercent.toFixed(1) + '%';
-    $('mem').textContent = s.machine.memPercent.toFixed(1) + '%';
+    setUsage('cpu', 'cpuBar', s.machine.cpuPercent);
+    setUsage('mem', 'memBar', s.machine.memPercent);
     $('memSub').textContent = s.machine.memUsedMb + ' / ' + s.machine.memTotalMb + ' MB';
-    $('disk').textContent = s.machine.diskPercent.toFixed(1) + '%';
+    setUsage('disk', 'diskBar', s.machine.diskPercent);
     $('diskSub').textContent = s.machine.diskUsedMb + ' / ' + s.machine.diskTotalMb + ' MB';
     $('players').textContent = s.minecraft.playersOnline + ' / ' + s.minecraft.maxPlayers;
     const players = Array.isArray(s.minecraft.players) ? s.minecraft.players : [];
     $('playerNames').textContent = players.length ? players.join(', ') : 'No players online';
+    const world = s.minecraft.world || {};
+    $('worldName').textContent = world.name || '-';
+    $('worldDetails').textContent = [
+      world.size ? 'Size ' + world.size : '',
+      world.gameMode ? 'Mode ' + world.gameMode : '',
+      world.difficulty ? 'Difficulty ' + world.difficulty : '',
+      world.hardcore ? 'Hardcore' : 'Hardcore off'
+    ].filter(Boolean).join(' | ');
+    setPowerButton('minecraft', s.processes.minecraft.running);
+    setPowerButton('playit', s.processes.playit.running);
+    $('worldUploadButton').disabled = s.processes.minecraft.running;
+    $('worldUploadButton').title = s.processes.minecraft.running ? 'Stop Minecraft before uploading a world zip' : '';
     $('mcHealth').innerHTML =
       pill(s.processes.minecraft.running ? 'process running' : 'process stopped', s.processes.minecraft.running) +
       pill(s.minecraft.portOpen ? 'port open' : 'port closed', s.minecraft.portOpen) +
@@ -2106,7 +2744,7 @@ async function refreshAll() {
     $('playitHealth').innerHTML =
       pill(s.processes.playit.running ? 'process running' : 'process stopped', s.processes.playit.running) +
       pill(s.playit.socketExists ? 'socket exists' : 'socket missing', s.playit.socketExists);
-    $('playitAddress').textContent = s.playit.address ? 'Address: ' + s.playit.address : 'Address not detected in logs yet';
+    $('playitAddress').textContent = s.playit.address ? 'Server: ' + s.playit.address : 'Server address not detected in logs yet';
     drawChart(await json('/api/metrics'));
   } catch (e) {
     $('updated').textContent = 'Error: ' + e.message;
@@ -2248,6 +2886,42 @@ async function act(target, action) {
   setTimeout(refreshAll, 1000);
 }
 
+async function powerAct(target) {
+  const button = $(target + 'Power');
+  await act(target, button.dataset.action || 'start');
+}
+
+function downloadWorld() {
+  window.location.href = '/api/world/download';
+}
+
+async function uploadWorld() {
+  const input = $('worldUpload');
+  const button = $('worldUploadButton');
+  const output = $('worldTransfer');
+  const file = input.files && input.files[0];
+  if (!file) return;
+  if (!file.name.toLowerCase().endsWith('.zip')) {
+    output.textContent = 'Only .zip files are accepted';
+    input.value = '';
+    return;
+  }
+  const data = new FormData();
+  data.append('world', file);
+  button.disabled = true;
+  output.textContent = 'Uploading ' + file.name + '...';
+  try {
+    const res = await fetch('/api/world/upload', { method: 'POST', body: data });
+    if (!res.ok) throw new Error(await res.text());
+    output.textContent = 'World uploaded';
+  } catch (e) {
+    output.textContent = e.message.trim();
+  } finally {
+    input.value = '';
+    await refreshAll();
+  }
+}
+
 function formatDuration(sec) {
   if (!sec) return '-';
   const h = Math.floor(sec / 3600);
@@ -2256,34 +2930,255 @@ function formatDuration(sec) {
 }
 
 function drawChart(points) {
-  const canvas = $('chart');
-  const ctx = canvas.getContext('2d');
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.strokeStyle = '#333941';
-  ctx.lineWidth = 1;
-  for (let y = 20; y <= 200; y += 45) {
-    ctx.beginPath(); ctx.moveTo(30, y); ctx.lineTo(1180, y); ctx.stroke();
+  metricPoints = Array.isArray(points) ? points : [];
+  renderMetricChart();
+}
+
+function renderMetricChart() {
+  if (!window.Chart) {
+    $('updated').textContent = 'Chart library failed to load';
+    return;
   }
-  drawLine(ctx, points.map(p => p.cpuPercent), '#63b3ed');
-  drawLine(ctx, points.map(p => p.memPercent), '#31c48d');
-  drawLine(ctx, points.map(p => p.diskPercent), '#f6ad55');
-  ctx.fillStyle = '#9ba7b3';
-  ctx.fillText('CPU blue, memory green, disk orange', 34, 214);
-}
+  const canvas = $('chart');
+  const rangeEnd = Date.now();
+  const rangeStart = rangeEnd - chartRangeHours * 3600 * 1000;
+  const parsed = metricPoints.map(parseMetricPoint).filter(Boolean).sort((a, b) => a.ts - b.ts);
+  visibleMetricPoints = parsed.filter(p => p.ts >= rangeStart && p.ts <= rangeEnd);
+  visibleDowntime = downtimeIntervals(parsed, rangeStart, rangeEnd);
+  renderAvailability(rangeStart, rangeEnd, visibleMetricPoints, visibleDowntime);
 
-function drawLine(ctx, values, color) {
-  if (!values.length) return;
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  values.forEach((v, i) => {
-    const x = 34 + (i / Math.max(1, values.length - 1)) * 1140;
-    const y = 200 - (Math.max(0, Math.min(100, v)) / 100) * 180;
-    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  const datasets = [
+    chartDataset('CPU', seriesWithGaps(visibleMetricPoints, 'cpuPercent'), '#38bdf8', 'rgba(56,189,248,0.14)'),
+    chartDataset('Memory', seriesWithGaps(visibleMetricPoints, 'memPercent'), '#36d399', 'rgba(54,211,153,0.12)'),
+    chartDataset('Disk', seriesWithGaps(visibleMetricPoints, 'diskPercent'), '#fbbf24', 'rgba(251,191,36,0.10)')
+  ];
+
+  if (!metricChart) {
+    metricChart = new Chart(canvas, {
+      type: 'line',
+      data: { datasets },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        normalized: true,
+        parsing: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: {
+            labels: { color: '#d8dee6', usePointStyle: true, boxWidth: 8, boxHeight: 8 }
+          },
+          tooltip: {
+            backgroundColor: '#0b0f16',
+            borderColor: '#2b3340',
+            borderWidth: 1,
+            titleColor: '#e8ecef',
+            bodyColor: '#d8dee6',
+            displayColors: true,
+            callbacks: {
+              title: items => {
+                const point = items[0] && items[0].raw;
+                return point && point.x ? formatBrowserDateTime(point.x) : '';
+              },
+              label: item => item.dataset.label + ': ' + Number(item.parsed.y || 0).toFixed(1) + '%'
+            }
+          }
+        },
+        scales: {
+          x: {
+            type: 'linear',
+            min: rangeStart,
+            max: rangeEnd,
+            grid: { color: 'rgba(154,166,178,0.08)', drawBorder: false },
+            ticks: {
+              color: '#9aa6b2',
+              maxRotation: 0,
+              autoSkip: true,
+              maxTicksLimit: 8,
+              callback: value => formatMetricTime(Number(value))
+            }
+          },
+          y: {
+            min: 0,
+            max: 100,
+            grid: { color: 'rgba(154,166,178,0.12)', drawBorder: false },
+            ticks: { color: '#9aa6b2', callback: value => value + '%' }
+          }
+        },
+        elements: {
+          point: { radius: 0, hoverRadius: 4, hitRadius: 12 },
+          line: { borderWidth: 2 }
+        }
+      },
+      plugins: [downtimeBandsPlugin]
+    });
+    return;
+  }
+
+  metricChart.options.scales.x.min = rangeStart;
+  metricChart.options.scales.x.max = rangeEnd;
+  metricChart.data.datasets.forEach((dataset, i) => {
+    dataset.data = datasets[i].data;
   });
-  ctx.stroke();
+  metricChart.update('none');
 }
 
+function chartDataset(label, data, borderColor, backgroundColor) {
+  return {
+    label,
+    data,
+    borderColor,
+    backgroundColor,
+    fill: true,
+    spanGaps: false,
+    tension: 0.32
+  };
+}
+
+function formatMetricTime(value) {
+  const date = new Date(value);
+  if (chartRangeHours <= 24) {
+    return date.toLocaleTimeString([], {
+      hour: '2-digit',
+      minute: '2-digit',
+      timeZone: browserTimeZone
+    });
+  }
+  return date.toLocaleDateString([], {
+    month: 'short',
+    day: 'numeric',
+    timeZone: browserTimeZone
+  });
+}
+
+function formatBrowserDateTime(value) {
+  return new Date(value).toLocaleString([], {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    timeZoneName: 'short',
+    timeZone: browserTimeZone
+  });
+}
+
+function parseMetricPoint(point) {
+  const ts = Date.parse(point.time);
+  if (!Number.isFinite(ts)) return null;
+  return {
+    ts,
+    cpuPercent: Number(point.cpuPercent) || 0,
+    memPercent: Number(point.memPercent) || 0,
+    diskPercent: Number(point.diskPercent) || 0
+  };
+}
+
+function seriesWithGaps(points, key) {
+  const data = [];
+  let previous = null;
+  for (const point of points) {
+    if (previous && point.ts - previous.ts > downtimeGapMs) {
+      data.push({ x: previous.ts + metricSampleMs, y: null });
+      data.push({ x: point.ts - metricSampleMs, y: null });
+    }
+    data.push({ x: point.ts, y: point[key] });
+    previous = point;
+  }
+  return data;
+}
+
+function downtimeIntervals(points, rangeStart, rangeEnd) {
+  const intervals = [];
+  let previous = null;
+  let sawPointInRange = false;
+
+  for (const point of points) {
+    if (point.ts < rangeStart) {
+      previous = point;
+      continue;
+    }
+    if (point.ts > rangeEnd) break;
+
+    sawPointInRange = true;
+    if (previous && point.ts - previous.ts > downtimeGapMs) {
+      intervals.push({
+        start: Math.max(rangeStart, previous.ts + metricSampleMs),
+        end: Math.min(rangeEnd, point.ts - metricSampleMs)
+      });
+    } else if (!previous && point.ts - rangeStart > downtimeGapMs) {
+      intervals.push({ start: rangeStart, end: point.ts - metricSampleMs });
+    }
+    previous = point;
+  }
+
+  if (previous && rangeEnd - previous.ts > downtimeGapMs) {
+    intervals.push({ start: Math.max(rangeStart, previous.ts + metricSampleMs), end: rangeEnd });
+  } else if (!previous && !sawPointInRange && points.length > 0) {
+    intervals.push({ start: rangeStart, end: rangeEnd });
+  }
+
+  return intervals.filter(interval => interval.end - interval.start > 0);
+}
+
+function renderAvailability(rangeStart, rangeEnd, points, intervals) {
+  if (!points.length && !intervals.length) {
+    $('chartAvailability').textContent = 'No metric samples for this range yet.';
+    return;
+  }
+  const downtimeMs = intervals.reduce((sum, interval) => sum + Math.max(0, interval.end - interval.start), 0);
+  const totalMs = Math.max(1, rangeEnd - rangeStart);
+  const uptimePercent = Math.max(0, Math.min(100, 100 - downtimeMs * 100 / totalMs));
+  const gapLabel = intervals.length === 1 ? 'gap' : 'gaps';
+  $('chartAvailability').textContent =
+    'Availability ' + uptimePercent.toFixed(1) + '% | ' +
+    formatDowntime(downtimeMs) + ' downtime | ' +
+    intervals.length + ' ' + gapLabel + ' | Times shown in ' + browserTimeZoneLabel;
+}
+
+function formatDowntime(ms) {
+  if (ms < 60 * 1000) return '0m';
+  const minutes = Math.round(ms / 60000);
+  if (minutes < 60) return minutes + 'm';
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  if (hours < 24) return hours + 'h ' + rest + 'm';
+  const days = Math.floor(hours / 24);
+  const dayHours = hours % 24;
+  return days + 'd ' + dayHours + 'h';
+}
+
+const downtimeBandsPlugin = {
+  id: 'downtimeBands',
+  beforeDatasetsDraw(chart) {
+    if (!visibleDowntime.length) return;
+    const { ctx, chartArea, scales } = chart;
+    if (!chartArea || !scales.x) return;
+    ctx.save();
+    ctx.fillStyle = 'rgba(251,113,133,0.13)';
+    for (const interval of visibleDowntime) {
+      const left = Math.max(chartArea.left, scales.x.getPixelForValue(interval.start));
+      const right = Math.min(chartArea.right, scales.x.getPixelForValue(interval.end));
+      if (right - left >= 1) {
+        ctx.fillRect(left, chartArea.top, right - left, chartArea.bottom - chartArea.top);
+      }
+    }
+    ctx.restore();
+  }
+};
+
+function initChartControls() {
+  $('chartRanges').addEventListener('click', event => {
+    const button = event.target.closest('button[data-hours]');
+    if (!button) return;
+    chartRangeHours = Number(button.dataset.hours);
+    for (const el of $('chartRanges').querySelectorAll('button')) {
+      el.classList.toggle('active', el === button);
+    }
+    renderMetricChart();
+  });
+}
+
+initChartControls();
 refreshAll();
 $('commandInput').addEventListener('keydown', handleCommandKey);
 startLogPolling();
