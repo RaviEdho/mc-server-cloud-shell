@@ -8,7 +8,7 @@ It is currently organized around these main files:
 
 - `install.sh`: one-time bootstrap script for a fresh install
 - `setup-minecraft-cloudshell.sh`: legacy Cloud Shell installer entry point kept during the rewrite
-- `cloudshell-mc-monitor.go`: Go supervisor and web monitoring dashboard
+- `monitor/monitor.py`: Python supervisor and web monitoring dashboard
 
 ## Quick Start
 
@@ -41,16 +41,16 @@ After setup completes, open Cloud Shell Web Preview on port `8080`.
 
 1. Checks required commands and available disk space.
 2. Creates the install directory, defaulting to `~/minecraft-server`.
-3. Installs SDKMAN if it is missing.
+3. Resolves the Java provider, using APT first on generic Linux and SDKMAN as fallback.
 4. Resolves the requested Minecraft version.
 5. Resolves the required Java major version.
-6. Installs and selects that Java version through SDKMAN.
+6. Installs and selects that Java version.
 7. Downloads the Fabric installer.
 8. Installs the Fabric server files.
 9. Writes `eula=true` only after explicit agreement.
 10. Downloads both playit binaries.
 11. Runs the interactive playit claim flow.
-12. Builds the Go monitor.
+12. Installs the Python monitor.
 13. Enables RCON/query in `server.properties`.
 14. Adds an idempotent `.bashrc` autostart block.
 15. Starts the monitor and verifies the server becomes reachable.
@@ -73,7 +73,7 @@ After setup completes, open Cloud Shell Web Preview on port `8080`.
 -h, --help                 Show help.
 ```
 
-On generic Linux, `auto` uses `systemd-user` when a user systemd session is available and falls back to manual scripts otherwise. The generic Linux path still uses the current Go monitor until the Python monitor replacement phase.
+On generic Linux, `auto` uses `systemd-user` when a user systemd session is available and falls back to manual scripts otherwise.
 
 ## Generic Linux Service Modes
 
@@ -121,7 +121,7 @@ You can override this with:
 ./install.sh --java-major 25 --agree-eula
 ```
 
-The script then asks SDKMAN for a matching Java candidate, preferring Temurin builds when available.
+On generic Ubuntu/Debian systems, the script first tries the matching `openjdk-*-jdk-headless` APT package. On Cloud Shell, or when the APT package is unavailable, the script asks SDKMAN for a matching Java candidate, preferring Temurin builds when available.
 
 ## Minecraft And Fabric Install
 
@@ -197,10 +197,10 @@ If you already have a valid playit secret, the script reuses it.
 
 ## Monitor And Autostart
 
-The Go monitor is built as:
+The Python monitor is installed as:
 
 ```text
-~/minecraft-server/cloudshell-mc-monitor
+~/minecraft-server/mc-monitor
 ```
 
 It supervises:
@@ -220,11 +220,11 @@ It also creates:
 The setup script adds this managed block to `~/.bashrc`:
 
 ```bash
-# >>> minecraft-cloudshell-monitor >>>
-if [ -x "$HOME/minecraft-server/cloudshell-mc-monitor" ]; then
-  MC_MONITOR_ROOT="$HOME/minecraft-server" "$HOME/minecraft-server/cloudshell-mc-monitor" -start >/dev/null 2>&1
+# >>> minecraft-monitor >>>
+if [ -x "$HOME/minecraft-server/mc-monitor" ]; then
+  MC_MONITOR_ROOT="$HOME/minecraft-server" "$HOME/minecraft-server/mc-monitor" -start >/dev/null 2>&1
 fi
-# <<< minecraft-cloudshell-monitor <<<
+# <<< minecraft-monitor <<<
 ```
 
 That means a new Cloud Shell session starts the monitor automatically. Cloud Shell still cannot run while the Cloud Shell VM is stopped due to inactivity.
@@ -299,56 +299,56 @@ cd ~/minecraft-server
 Check status:
 
 ```bash
-./cloudshell-mc-monitor -status
+./mc-monitor -status
 ```
 
 Start monitor:
 
 ```bash
-./cloudshell-mc-monitor -start
+./mc-monitor -start
 ```
 
 Stop monitor:
 
 ```bash
-./cloudshell-mc-monitor -stop
+./mc-monitor -stop
 ```
 
 Restart all services:
 
 ```bash
-./cloudshell-mc-monitor -restart
-./cloudshell-mc-monitor -restart all
+./mc-monitor -restart
+./mc-monitor -restart all
 ```
 
 Restart only the web monitor without stopping Minecraft:
 
 ```bash
-./cloudshell-mc-monitor -restart monitor
-./cloudshell-mc-monitor -restart mon
-./cloudshell-mc-monitor -restart web
+./mc-monitor -restart monitor
+./mc-monitor -restart mon
+./mc-monitor -restart web
 ```
 
 Restart only Minecraft:
 
 ```bash
-./cloudshell-mc-monitor -restart minecraft
-./cloudshell-mc-monitor -restart mc
-./cloudshell-mc-monitor -restart server
+./mc-monitor -restart minecraft
+./mc-monitor -restart mc
+./mc-monitor -restart server
 ```
 
 Restart only playit:
 
 ```bash
-./cloudshell-mc-monitor -restart playit
-./cloudshell-mc-monitor -restart conn
-./cloudshell-mc-monitor -restart connection
+./mc-monitor -restart playit
+./mc-monitor -restart conn
+./mc-monitor -restart connection
 ```
 
 Apply RCON/query config again:
 
 ```bash
-./cloudshell-mc-monitor -configure
+./mc-monitor -configure
 ```
 
 The monitor helper supports these modes:

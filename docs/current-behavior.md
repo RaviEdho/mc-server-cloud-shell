@@ -25,7 +25,7 @@ The Cloud Shell-compatible install path should still:
 - Prompt for Minecraft EULA acceptance unless `--agree-eula` is provided.
 - Download `playit-linux-amd64` and `playit-cli-linux-amd64`.
 - Run the interactive playit claim flow unless `--skip-playit-claim` is provided.
-- Build the current Go monitor.
+- Install the current Python monitor.
 - Configure RCON/query in `server.properties`.
 - Add the managed `.bashrc` autostart block.
 - Start the monitor unless `--no-start` is provided.
@@ -65,9 +65,9 @@ The current installer behavior should continue to support:
 
 ## Dashboard And Monitor
 
-The current Go monitor should still:
+The current Python monitor should:
 
-- Run as `~/minecraft-server/cloudshell-mc-monitor`.
+- Run as `~/minecraft-server/mc-monitor`.
 - Expose the dashboard/API on port `8080`.
 - Supervise Minecraft and playit.
 - Report machine, Minecraft, and playit status.

@@ -382,9 +382,13 @@ Exit criteria:
   - restart monitor/Minecraft/playit
 - Match the existing dashboard/API behavior before making Python the default.
 - Use the current Go monitor as the behavior reference, not as a long-term fallback.
+- Install `monitor/monitor.py` as `~/minecraft-server/mc-monitor`.
+- Remove Go from default installer prerequisites.
+- Remove Go build logic from the installer.
 
 Exit criteria:
 
+- Default one-line install does not require Go.
 - Python monitor can start Minecraft and playit.
 - Python monitor can expose the dashboard on port `8080`.
 - Python monitor can read status and logs.
@@ -393,18 +397,12 @@ Exit criteria:
 
 ### Phase 6: Remove The Go Path
 
-- Make Python the only default monitor runtime.
-- Remove Go from default prerequisites.
-- Remove Go build logic from the installer.
 - Remove Go monitor source if no longer needed.
 - Remove Go-specific docs and cleanup paths.
 - Update README examples and troubleshooting.
 
 Exit criteria:
 
-- Default one-line install does not require Go.
-- Cloud Shell install works with Python monitor.
-- Generic Linux install works with Python monitor.
 - No default path downloads, builds, or mentions Go.
 - Existing installations can update without leaving broken legacy files.
 

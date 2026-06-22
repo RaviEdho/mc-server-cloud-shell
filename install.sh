@@ -18,6 +18,7 @@ ACTIVE_SERVICE_MODE=""
 DETECTED_OS_ID=""
 DETECTED_OS_LIKE=""
 SYSTEMD_SERVICE_NAME="minecraft-monitor.service"
+MONITOR_PROGRAM_NAME="mc-monitor"
 
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
 if [[ -n "$SCRIPT_SOURCE" && -f "$SCRIPT_SOURCE" ]]; then
@@ -437,7 +438,6 @@ check_prerequisites() {
   require_command mktemp
   require_command mv
   require_command ps
-  require_command go
 
   local free_mb
   free_mb="$(df -Pm "$HOME" | awk 'NR==2 {print $4}')"
@@ -798,51 +798,41 @@ setup_playit_claim() {
 
 install_monitor() {
   update_monitor_program
-  MC_MONITOR_ROOT="$INSTALL_DIR" "$INSTALL_DIR/cloudshell-mc-monitor" -configure
+  MC_MONITOR_ROOT="$INSTALL_DIR" "$INSTALL_DIR/$MONITOR_PROGRAM_NAME" -configure
 }
 
 resolve_monitor_source() {
-  local local_source="$SCRIPT_DIR/cloudshell-mc-monitor.go"
+  local local_source="$SCRIPT_DIR/monitor/monitor.py"
   if [[ -f "$local_source" ]]; then
     MONITOR_SOURCE="$local_source"
     return 0
   fi
 
-  download_temp_file "$RAW_REPO_BASE/cloudshell-mc-monitor.go"
+  download_temp_file "$RAW_REPO_BASE/monitor/monitor.py"
   MONITOR_SOURCE="$DOWNLOADED_TEMP_FILE"
 }
 
 update_monitor_program() {
-  local go_source
-  local installed_source="$INSTALL_DIR/cloudshell-mc-monitor.go"
-  local installed_binary="$INSTALL_DIR/cloudshell-mc-monitor"
+  local python_source
+  local installed_binary="$INSTALL_DIR/$MONITOR_PROGRAM_NAME"
   local source_updated=0
-  local rebuilt=0
 
   resolve_monitor_source || die "Unable to resolve monitor source."
-  go_source="$MONITOR_SOURCE"
-  [[ -f "$go_source" ]] || die "Missing monitor source: $go_source"
+  python_source="$MONITOR_SOURCE"
+  [[ -f "$python_source" ]] || die "Missing monitor source: $python_source"
 
-  mkdir -p "$INSTALL_DIR" "$INSTALL_DIR/.gocache"
+  mkdir -p "$INSTALL_DIR"
 
-  if [[ ! -f "$installed_source" || "$go_source" -nt "$installed_source" ]]; then
-    log "Updating monitor source: $installed_source"
-    cp "$go_source" "$installed_source"
+  if [[ ! -f "$installed_binary" || "$python_source" -nt "$installed_binary" ]]; then
+    log "Updating Python monitor: $installed_binary"
+    cp "$python_source" "$installed_binary"
+    chmod +x "$installed_binary"
     source_updated=1
   else
-    log "Monitor source is already current."
+    log "Python monitor is already current."
   fi
 
-  if [[ "$source_updated" -eq 1 || ! -x "$installed_binary" || "$installed_source" -nt "$installed_binary" ]]; then
-    log "Building monitor"
-    GOCACHE="$INSTALL_DIR/.gocache" go build -o "$installed_binary" "$installed_source"
-    chmod +x "$installed_binary"
-    rebuilt=1
-  else
-    log "Monitor binary is already current."
-  fi
-
-  if [[ "$source_updated" -eq 0 && "$rebuilt" -eq 0 ]]; then
+  if [[ "$source_updated" -eq 0 ]]; then
     log "No monitor update needed."
   fi
 
@@ -852,10 +842,13 @@ update_monitor_program() {
 cleanup_legacy_monitor_files() {
   local legacy_source="$INSTALL_DIR/cloudshell-mc-autostart.go"
   local legacy_binary="$INSTALL_DIR/cloudshell-mc-autostart"
+  local go_source="$INSTALL_DIR/cloudshell-mc-monitor.go"
+  local go_binary="$INSTALL_DIR/cloudshell-mc-monitor"
+  local go_cache="$INSTALL_DIR/.gocache"
 
-  if [[ -e "$legacy_source" || -e "$legacy_binary" ]]; then
-    log "Removing legacy monitor filenames."
-    rm -f "$legacy_source" "$legacy_binary"
+  if [[ -e "$legacy_source" || -e "$legacy_binary" || -e "$go_source" || -e "$go_binary" || -e "$go_cache" ]]; then
+    log "Removing legacy Go monitor files."
+    rm -rf "$legacy_source" "$legacy_binary" "$go_source" "$go_binary" "$go_cache"
   fi
 }
 
@@ -874,16 +867,18 @@ install_bashrc_hook() {
     /# <<< minecraft-cloudshell-monitor <<</ {skip=0; next}
     /# >>> minecraft-cloudshell-autostart >>>/ {skip=1; next}
     /# <<< minecraft-cloudshell-autostart <<</ {skip=0; next}
+    /# >>> minecraft-monitor >>>/ {skip=1; next}
+    /# <<< minecraft-monitor <<</ {skip=0; next}
     !skip {print}
   ' "$bashrc" > "$tmp"
 
   local block
   block="$(cat <<EOF
-# >>> minecraft-cloudshell-monitor >>>
-if [ -x "$INSTALL_DIR/cloudshell-mc-monitor" ]; then
-  MC_MONITOR_ROOT="$INSTALL_DIR" "$INSTALL_DIR/cloudshell-mc-monitor" -start >/dev/null 2>&1
+# >>> minecraft-monitor >>>
+if [ -x "$INSTALL_DIR/$MONITOR_PROGRAM_NAME" ]; then
+  MC_MONITOR_ROOT="$INSTALL_DIR" "$INSTALL_DIR/$MONITOR_PROGRAM_NAME" -start >/dev/null 2>&1
 fi
-# <<< minecraft-cloudshell-monitor <<<
+# <<< minecraft-monitor <<<
 EOF
 )"
 
@@ -912,7 +907,7 @@ systemd_quote() {
 }
 
 install_control_scripts() {
-  local monitor="$INSTALL_DIR/cloudshell-mc-monitor"
+  local monitor="$INSTALL_DIR/$MONITOR_PROGRAM_NAME"
   local addr="${1:-127.0.0.1:8080}"
 
   cat > "$INSTALL_DIR/start.sh" <<EOF
@@ -921,7 +916,7 @@ set -Eeuo pipefail
 ROOT="\$(cd -- "\$(dirname -- "\${BASH_SOURCE[0]}")" && pwd)"
 export MC_MONITOR_ROOT="\$ROOT"
 export MC_MONITOR_ADDR="\${MC_MONITOR_ADDR:-$addr}"
-exec "\$ROOT/cloudshell-mc-monitor" -start
+exec "\$ROOT/$MONITOR_PROGRAM_NAME" -start
 EOF
 
   cat > "$INSTALL_DIR/stop.sh" <<'EOF'
@@ -929,7 +924,7 @@ EOF
 set -Eeuo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 export MC_MONITOR_ROOT="$ROOT"
-exec "$ROOT/cloudshell-mc-monitor" -stop
+exec "$ROOT/$MONITOR_PROGRAM_NAME" -stop
 EOF
 
   cat > "$INSTALL_DIR/status.sh" <<EOF
@@ -938,7 +933,7 @@ set -Eeuo pipefail
 ROOT="\$(cd -- "\$(dirname -- "\${BASH_SOURCE[0]}")" && pwd)"
 export MC_MONITOR_ROOT="\$ROOT"
 export MC_MONITOR_ADDR="\${MC_MONITOR_ADDR:-$addr}"
-exec "\$ROOT/cloudshell-mc-monitor" -status
+exec "\$ROOT/$MONITOR_PROGRAM_NAME" -status
 EOF
 
   chmod +x "$INSTALL_DIR/start.sh" "$INSTALL_DIR/stop.sh" "$INSTALL_DIR/status.sh"
@@ -950,7 +945,7 @@ install_systemd_user_service() {
 
   local service_dir="$HOME/.config/systemd/user"
   local service_path="$service_dir/$SYSTEMD_SERVICE_NAME"
-  local monitor="$INSTALL_DIR/cloudshell-mc-monitor"
+  local monitor="$INSTALL_DIR/$MONITOR_PROGRAM_NAME"
 
   mkdir -p "$service_dir"
   cat > "$service_path" <<EOF
@@ -1002,7 +997,7 @@ platform_stop_monitor() {
       systemctl --user stop "$SYSTEMD_SERVICE_NAME" >/dev/null 2>&1 || true
       ;;
     *)
-      MC_MONITOR_ROOT="$INSTALL_DIR" "$INSTALL_DIR/cloudshell-mc-monitor" -stop >/dev/null 2>&1 || true
+      MC_MONITOR_ROOT="$INSTALL_DIR" "$INSTALL_DIR/$MONITOR_PROGRAM_NAME" -stop >/dev/null 2>&1 || true
       ;;
   esac
 }
@@ -1013,10 +1008,10 @@ platform_start_monitor() {
       systemctl --user start "$SYSTEMD_SERVICE_NAME"
       ;;
     generic-linux:none)
-      MC_MONITOR_ROOT="$INSTALL_DIR" MC_MONITOR_ADDR="127.0.0.1:8080" "$INSTALL_DIR/cloudshell-mc-monitor" -start
+      MC_MONITOR_ROOT="$INSTALL_DIR" MC_MONITOR_ADDR="127.0.0.1:8080" "$INSTALL_DIR/$MONITOR_PROGRAM_NAME" -start
       ;;
     cloudshell:bashrc)
-      MC_MONITOR_ROOT="$INSTALL_DIR" "$INSTALL_DIR/cloudshell-mc-monitor" -start
+      MC_MONITOR_ROOT="$INSTALL_DIR" "$INSTALL_DIR/$MONITOR_PROGRAM_NAME" -start
       ;;
     *)
       die "Unsupported monitor start mode: $ACTIVE_PLATFORM/$ACTIVE_SERVICE_MODE"
@@ -1030,10 +1025,10 @@ platform_restart_monitor_only() {
       systemctl --user restart "$SYSTEMD_SERVICE_NAME"
       ;;
     generic-linux:none)
-      MC_MONITOR_ROOT="$INSTALL_DIR" MC_MONITOR_ADDR="127.0.0.1:8080" "$INSTALL_DIR/cloudshell-mc-monitor" -restart monitor
+      MC_MONITOR_ROOT="$INSTALL_DIR" MC_MONITOR_ADDR="127.0.0.1:8080" "$INSTALL_DIR/$MONITOR_PROGRAM_NAME" -restart monitor
       ;;
     cloudshell:bashrc)
-      MC_MONITOR_ROOT="$INSTALL_DIR" "$INSTALL_DIR/cloudshell-mc-monitor" -restart monitor
+      MC_MONITOR_ROOT="$INSTALL_DIR" "$INSTALL_DIR/$MONITOR_PROGRAM_NAME" -restart monitor
       ;;
     *)
       die "Unsupported monitor restart mode: $ACTIVE_PLATFORM/$ACTIVE_SERVICE_MODE"
@@ -1077,7 +1072,6 @@ update_monitor_only() {
   require_command curl
   require_command cp
   require_command chmod
-  require_command go
   require_command mktemp
   require_command mkdir
   require_command rm
@@ -1120,9 +1114,9 @@ Install directory:
 
 Useful commands:
   cd "$INSTALL_DIR"
-  ./cloudshell-mc-monitor -status
-  ./cloudshell-mc-monitor -stop
-  ./cloudshell-mc-monitor -start
+  ./$MONITOR_PROGRAM_NAME -status
+  ./$MONITOR_PROGRAM_NAME -stop
+  ./$MONITOR_PROGRAM_NAME -start
 
 Logs:
   tail -f "$INSTALL_DIR/.runtime/supervisor.log"
