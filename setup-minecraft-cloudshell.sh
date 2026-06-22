@@ -655,7 +655,7 @@ start_and_verify_monitor() {
   local status_url="http://127.0.0.1:8080/api/status"
   for _ in $(seq 1 90); do
     if curl -fsS "$status_url" > "$SETUP_DIR/status.json" 2>/dev/null; then
-      if grep -q '"portOpen":true' "$SETUP_DIR/status.json"; then
+      if grep -Eq '"portOpen"[[:space:]]*:[[:space:]]*true' "$SETUP_DIR/status.json"; then
         log "Monitor and Minecraft are responding."
         return 0
       fi
