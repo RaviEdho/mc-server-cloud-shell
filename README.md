@@ -421,6 +421,10 @@ If playit setup fails, inspect:
 tail -n 120 ~/minecraft-server/.setup/playit-daemon.log
 ```
 
+If an existing playit secret is no longer valid, for example after deleting the
+agent in playit.gg, the installer prompts to either back up the stale secret and
+claim a new agent, skip playit reconfiguration for now, or abort.
+
 If the monitor starts but Minecraft does not become healthy, inspect:
 
 ```bash
