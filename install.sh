@@ -744,54 +744,142 @@ start_playit_setup_daemon() {
   die "playit daemon did not create socket $socket."
 }
 
+stop_playit_setup_daemon() {
+  local socket="$1"
+  if [[ -n "${PLAYIT_SETUP_PID:-}" ]]; then
+    kill "$PLAYIT_SETUP_PID" 2>/dev/null || true
+    wait "$PLAYIT_SETUP_PID" 2>/dev/null || true
+    PLAYIT_SETUP_PID=""
+  fi
+  rm -f "$socket"
+}
+
+run_playit_cli_setup() {
+  local socket="$1"
+  require_tty "playit first-time setup requires an interactive terminal. Rerun with --skip-playit-claim to skip it."
+  log "Running playit setup. Open the claim link it prints; setup will continue after the claim completes."
+  set +e
+  "$INSTALL_DIR/playit-cli-linux-amd64" --socket-path "$socket" setup < /dev/tty
+  local cli_code=$?
+  set -e
+  if [[ "$cli_code" -ne 0 ]]; then
+    log "playit CLI exited with code $cli_code; verifying daemon/secret state anyway."
+  fi
+}
+
 verify_playit_claim() {
   local secret="$1"
+  local mode="${2:-new}"
   local log_file="$SETUP_DIR/playit-daemon.log"
-  [[ -s "$secret" ]] || die "playit secret was not created at $secret."
-  kill -0 "$PLAYIT_SETUP_PID" 2>/dev/null || die "playit daemon is not running after CLI setup."
+  if [[ ! -s "$secret" ]]; then
+    log "playit secret was not created at $secret."
+    return 1
+  fi
+  if ! kill -0 "$PLAYIT_SETUP_PID" 2>/dev/null; then
+    log "playit daemon is not running after CLI setup."
+    return 1
+  fi
 
   for _ in $(seq 1 45); do
     if grep -Eq "playit connected|tunnels loaded|account_status" "$log_file"; then
       log "playit setup verified."
       return 0
     fi
+    if [[ "$mode" == "existing" ]] && grep -Eq "InvalidAgentKey|configured agent secret is no longer valid" "$log_file"; then
+      tail -n 120 "$log_file" >&2 || true
+      log "Existing playit secret is no longer valid."
+      return 1
+    fi
     sleep 1
   done
 
   tail -n 120 "$log_file" >&2 || true
-  die "playit daemon did not report a connected/verified account."
+  log "playit daemon did not report a connected/verified account."
+  return 1
+}
+
+recover_existing_playit_secret() {
+  local socket="$1"
+  local secret="$2"
+  local reply
+
+  if [[ ! -r /dev/tty || ! -w /dev/tty ]]; then
+    log "Existing playit secret could not be verified, and no interactive terminal is available."
+    log "Skipping playit reconfiguration; rerun interactively or remove $secret to claim a new playit agent."
+    stop_playit_setup_daemon "$socket"
+    return 0
+  fi
+
+  while true; do
+    print_setup_block 1 <<EOF
+[setup] Existing playit secret could not be verified.
+[setup] This usually means the previous playit agent was deleted or its key was revoked.
+[setup] Choose: [c] clean up and claim a new playit agent, [s] skip playit setup for now, [a] abort.
+EOF
+    printf "[setup] Selection [c/s/a]: " > /dev/tty
+    read -r reply < /dev/tty
+    case "${reply,,}" in
+      c|cleanup|r|reconfigure)
+        stop_playit_setup_daemon "$socket"
+        local backup="${secret}.invalid.$(date +%Y%m%d%H%M%S)"
+        mv "$secret" "$backup"
+        log "Moved invalid playit secret to $backup."
+        start_playit_setup_daemon "$socket" "$secret"
+        run_playit_cli_setup "$socket"
+        if verify_playit_claim "$secret" "new"; then
+          stop_playit_setup_daemon "$socket"
+          return 0
+        fi
+        stop_playit_setup_daemon "$socket"
+        die "playit setup did not verify after reconfiguration."
+        ;;
+      s|skip)
+        log "Skipping playit reconfiguration; existing secret left at $secret."
+        stop_playit_setup_daemon "$socket"
+        return 0
+        ;;
+      a|abort)
+        stop_playit_setup_daemon "$socket"
+        die "playit setup aborted."
+        ;;
+      *)
+        log "Please enter c, s, or a."
+        ;;
+    esac
+  done
 }
 
 setup_playit_claim() {
   local socket="/tmp/playit.sock"
   local secret="$HOME/.config/playit_gg/playit.toml"
+  local had_secret=0
 
   if [[ "$SKIP_PLAYIT_CLAIM" -eq 1 ]]; then
     log "Skipping interactive playit claim flow."
     return 0
   fi
 
+  [[ -s "$secret" ]] && had_secret=1
   start_playit_setup_daemon "$socket" "$secret"
 
   if [[ ! -s "$secret" ]]; then
-    require_tty "playit first-time setup requires an interactive terminal. Rerun with --skip-playit-claim to skip it."
-    log "Running playit setup. Open the claim link it prints; setup will continue after the claim completes."
-    set +e
-    "$INSTALL_DIR/playit-cli-linux-amd64" --socket-path "$socket" setup < /dev/tty
-    local cli_code=$?
-    set -e
-    if [[ "$cli_code" -ne 0 ]]; then
-      log "playit CLI exited with code $cli_code; verifying daemon/secret state anyway."
-    fi
+    run_playit_cli_setup "$socket"
   else
     log "Existing playit secret found; verifying daemon connection."
   fi
 
-  verify_playit_claim "$secret"
-  kill "$PLAYIT_SETUP_PID" 2>/dev/null || true
-  wait "$PLAYIT_SETUP_PID" 2>/dev/null || true
-  PLAYIT_SETUP_PID=""
-  rm -f "$socket"
+  if verify_playit_claim "$secret" "$([[ "$had_secret" -eq 1 ]] && echo existing || echo new)"; then
+    stop_playit_setup_daemon "$socket"
+    return 0
+  fi
+
+  if [[ "$had_secret" -eq 1 ]]; then
+    recover_existing_playit_secret "$socket" "$secret"
+    return 0
+  fi
+
+  stop_playit_setup_daemon "$socket"
+  die "playit daemon did not report a connected/verified account."
 }
 
 # Monitor installation/update
