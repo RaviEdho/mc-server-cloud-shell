@@ -8,7 +8,7 @@ It is currently organized around these main files:
 
 - `install.sh`: one-time bootstrap script for a fresh install
 - `setup-minecraft-cloudshell.sh`: legacy Cloud Shell installer entry point kept during the rewrite
-- `monitor/monitor.py`: Python supervisor and web monitoring dashboard
+- `monitor.py`: Python supervisor and web monitoring dashboard
 
 ## Quick Start
 

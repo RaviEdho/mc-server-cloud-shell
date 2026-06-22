@@ -29,6 +29,7 @@ fi
 SETUP_DIR=""
 PLAYIT_SETUP_PID=""
 SETUP_COLOR="1;36"
+SETUP_ERROR_COLOR="1;31"
 RAW_REPO_REF="${RAW_REPO_REF:-rewrite-generic-installer}"
 RAW_REPO_BASE="${RAW_REPO_BASE:-https://raw.githubusercontent.com/RaviEdho/mc-server-cloud-shell/$RAW_REPO_REF}"
 TEMP_FILES=()
@@ -56,6 +57,7 @@ print_setup_text() {
   local fd="$1"
   local text="$2"
   local ending="${3:-$'\n'}"
+  local color="${4:-$SETUP_COLOR}"
 
   if [[ -z "$text" ]]; then
     print_plain "$fd" "$ending"
@@ -64,9 +66,9 @@ print_setup_text() {
 
   if color_enabled "$fd"; then
     if [[ "$fd" -eq 2 ]]; then
-      printf '\033[%sm%s\033[0m%s' "$SETUP_COLOR" "$text" "$ending" >&2
+      printf '\033[%sm%s\033[0m%s' "$color" "$text" "$ending" >&2
     else
-      printf '\033[%sm%s\033[0m%s' "$SETUP_COLOR" "$text" "$ending"
+      printf '\033[%sm%s\033[0m%s' "$color" "$text" "$ending"
     fi
   else
     print_plain "$fd" "${text}${ending}"
@@ -90,7 +92,7 @@ log() {
 }
 
 die() {
-  print_setup_text 2 "[setup] ERROR: $*"
+  print_setup_text 2 "[setup] ERROR: $*" $'\n' "$SETUP_ERROR_COLOR"
   exit 1
 }
 
@@ -891,13 +893,13 @@ install_monitor() {
 }
 
 resolve_monitor_source() {
-  local local_source="$SCRIPT_DIR/monitor/monitor.py"
+  local local_source="$SCRIPT_DIR/monitor.py"
   if [[ -f "$local_source" ]]; then
     MONITOR_SOURCE="$local_source"
     return 0
   fi
 
-  download_temp_file "$RAW_REPO_BASE/monitor/monitor.py"
+  download_temp_file "$RAW_REPO_BASE/monitor.py"
   MONITOR_SOURCE="$DOWNLOADED_TEMP_FILE"
 }
 

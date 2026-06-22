@@ -109,8 +109,7 @@ Repository layout:
 ```text
 README.md
 install.sh
-monitor/
-  monitor.py
+monitor.py
   dashboard/
 docs/
   rewrite-plan.md
@@ -374,7 +373,7 @@ Exit criteria:
 
 ### Phase 5: Replace The Go Monitor With A Python Monitor
 
-- Implement `monitor/monitor.py` with the same core CLI surface:
+- Implement `monitor.py` with the same core CLI surface:
   - `-start`
   - `-stop`
   - `-status`
@@ -382,7 +381,7 @@ Exit criteria:
   - restart monitor/Minecraft/playit
 - Match the existing dashboard/API behavior before making Python the default.
 - Use the current Go monitor as the behavior reference, not as a long-term fallback.
-- Install `monitor/monitor.py` as `~/minecraft-server/mc-monitor`.
+- Install `monitor.py` as `~/minecraft-server/mc-monitor`.
 - Remove Go from default installer prerequisites.
 - Remove Go build logic from the installer.
 
