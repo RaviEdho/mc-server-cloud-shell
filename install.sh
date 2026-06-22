@@ -29,7 +29,8 @@ fi
 SETUP_DIR=""
 PLAYIT_SETUP_PID=""
 SETUP_COLOR="1;36"
-RAW_REPO_BASE="${RAW_REPO_BASE:-https://raw.githubusercontent.com/RaviEdho/mc-server-cloud-shell/master}"
+RAW_REPO_REF="${RAW_REPO_REF:-rewrite-generic-installer}"
+RAW_REPO_BASE="${RAW_REPO_BASE:-https://raw.githubusercontent.com/RaviEdho/mc-server-cloud-shell/$RAW_REPO_REF}"
 TEMP_FILES=()
 DOWNLOADED_TEMP_FILE=""
 MONITOR_SOURCE=""

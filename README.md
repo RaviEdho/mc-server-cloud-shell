@@ -15,7 +15,7 @@ It is currently organized around these main files:
 Run the installer directly from GitHub:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/RaviEdho/mc-server-cloud-shell/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/RaviEdho/mc-server-cloud-shell/rewrite-generic-installer/install.sh | bash
 ```
 
 The setup script downloads the monitor source when needed, reads interactive prompts from the terminal, and cleans up temporary installer files automatically.
