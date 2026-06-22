@@ -31,6 +31,10 @@ color_enabled() {
   [[ -z "${SETUP_NO_COLOR:-}" && -t $fd ]]
 }
 
+tty_available() {
+  [[ -r /dev/tty && -w /dev/tty ]] && { : < /dev/tty > /dev/tty; } 2>/dev/null
+}
+
 print_plain() {
   local fd="$1"
   local text="$2"
@@ -71,7 +75,7 @@ print_setup_block() {
 }
 
 require_tty() {
-  [[ -r /dev/tty && -w /dev/tty ]] || die "$1"
+  tty_available || die "$1"
 }
 
 log() {
@@ -718,11 +722,93 @@ EOF
   rm -f "$tmp" "$tmp2"
 }
 
+port_listener_lines() {
+  local port="$1"
+  command -v ss >/dev/null 2>&1 || return 0
+  ss -ltnp 2>/dev/null | awk -v port="$port" '
+    NR > 1 {
+      n = split($4, parts, ":")
+      if (parts[n] == port) {
+        print
+      }
+    }
+  '
+}
+
+port_listener_pids() {
+  local port="$1"
+  port_listener_lines "$port" | grep -Eo 'pid=[0-9]+' | cut -d= -f2 | sort -u
+}
+
+kill_port_listeners() {
+  local port="$1"
+  local pids=()
+  local pid
+
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] && pids+=("$pid")
+  done < <(port_listener_pids "$port")
+
+  [[ "${#pids[@]}" -gt 0 ]] || return 1
+  log "Stopping process(es) listening on port $port: ${pids[*]}"
+  kill "${pids[@]}" 2>/dev/null || true
+
+  for _ in $(seq 1 10); do
+    if [[ -z "$(port_listener_lines "$port")" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  log "Process(es) did not exit cleanly; force killing port $port listener(s)."
+  kill -9 "${pids[@]}" 2>/dev/null || true
+  for _ in $(seq 1 5); do
+    if [[ -z "$(port_listener_lines "$port")" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 check_port_available() {
   local port="$1"
-  if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${port}$"; then
-    die "Port $port is already in use."
+  local details
+  local reply
+
+  details="$(port_listener_lines "$port")"
+  if [[ -z "$details" ]]; then
+    return 0
   fi
+
+  print_setup_block 2 <<EOF
+[setup] Port $port is already in use.
+$details
+EOF
+
+  if ! tty_available; then
+    die "Port $port is already in use. Stop the occupying process and rerun the installer."
+  fi
+
+  while true; do
+    printf "[setup] Kill process(es) listening on port %s and continue? [y/N]: " "$port" > /dev/tty
+    read -r reply < /dev/tty
+    case "${reply,,}" in
+      y|yes)
+        if kill_port_listeners "$port"; then
+          log "Port $port is now available."
+          return 0
+        fi
+        die "Port $port is still in use after attempting to stop the listener."
+        ;;
+      n|no|"")
+        die "Port $port is already in use."
+        ;;
+      *)
+        log "Please enter y or n."
+        ;;
+    esac
+  done
 }
 
 start_and_verify_monitor() {
@@ -741,7 +827,7 @@ start_and_verify_monitor() {
   local status_url="http://127.0.0.1:8080/api/status"
   for _ in $(seq 1 90); do
     if curl -fsS "$status_url" > "$SETUP_DIR/status.json" 2>/dev/null; then
-      if grep -q '"portOpen":true' "$SETUP_DIR/status.json"; then
+      if grep -Eq '"portOpen"[[:space:]]*:[[:space:]]*true' "$SETUP_DIR/status.json"; then
         log "Monitor and Minecraft are responding."
         return 0
       fi
